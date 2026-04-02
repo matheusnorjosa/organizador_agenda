@@ -1,19 +1,48 @@
 import os
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
 
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 TOKENS_DIR = os.path.join(os.path.dirname(__file__), "..", "tokens")
 CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "..", "credentials.json")
+REDIRECT_URI = "http://localhost:1"
 
 
 def get_token_path(user_id: str) -> str:
     os.makedirs(TOKENS_DIR, exist_ok=True)
     return os.path.join(TOKENS_DIR, f"{user_id}.json")
+
+
+def generate_auth_url() -> tuple[Flow, str]:
+    flow = Flow.from_client_secrets_file(
+        CREDENTIALS_PATH,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+    )
+    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+    return flow, auth_url
+
+
+def complete_auth(flow: Flow, redirect_url: str, user_id: str):
+    parsed = urlparse(redirect_url)
+    code = parse_qs(parsed.query).get("code", [None])[0]
+
+    if not code:
+        raise ValueError("Código de autorização não encontrado na URL.")
+
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+
+    token_path = get_token_path(user_id)
+    with open(token_path, "w") as token_file:
+        token_file.write(creds.to_json())
+
+    return creds
 
 
 def get_calendar_service(user_id: str):
@@ -26,12 +55,12 @@ def get_calendar_service(user_id: str):
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            with open(token_path, "w") as token_file:
+                token_file.write(creds.to_json())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        with open(token_path, "w") as token_file:
-            token_file.write(creds.to_json())
+            raise RuntimeError(
+                f"Usuário '{user_id}' não autenticado. Use /auth no Telegram."
+            )
 
     return build("calendar", "v3", credentials=creds)
 

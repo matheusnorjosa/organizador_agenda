@@ -7,13 +7,25 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
-from src.calendar_api import get_events, create_event, format_event, is_user_authenticated
+from src.calendar_api import (
+    get_events,
+    create_event,
+    format_event,
+    is_user_authenticated,
+    generate_auth_url,
+    complete_auth,
+)
 
 logger = logging.getLogger(__name__)
 
 USERS_PATH = os.path.join(os.path.dirname(__file__), "..", "users.json")
+
+WAITING_AUTH_URL = 0
 
 
 def load_users() -> dict:
@@ -40,8 +52,7 @@ async def check_user(update: Update) -> str | None:
 
     if not is_user_authenticated(user_id):
         await update.message.reply_text(
-            "Sua conta Google ainda não foi autenticada. "
-            "Peça ao administrador para rodar a autenticação."
+            "Sua conta Google ainda não foi conectada. Use /auth para autenticar."
         )
         return None
 
@@ -51,11 +62,70 @@ async def check_user(update: Update) -> str | None:
 async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📋 *Comandos disponíveis:*\n\n"
+        "/auth — Conecta sua conta Google\n"
         "/eventos — Lista os próximos eventos da agenda\n"
         "/criar <título> <dd/mm/aaaa> <hh:mm> — Cria um novo evento\n"
         "/ajuda — Mostra esta mensagem"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = update.effective_user.id
+    user_id = get_user_id(telegram_id)
+
+    if not user_id:
+        await update.message.reply_text(
+            "Você não está cadastrado. Peça ao administrador para te adicionar no users.json."
+        )
+        return ConversationHandler.END
+
+    if is_user_authenticated(user_id):
+        await update.message.reply_text("Sua conta Google já está conectada!")
+        return ConversationHandler.END
+
+    flow, auth_url = generate_auth_url()
+    context.user_data["auth_flow"] = flow
+    context.user_data["user_id"] = user_id
+
+    await update.message.reply_text(
+        "🔗 Clique no link abaixo para conectar sua conta Google:\n\n"
+        f"{auth_url}\n\n"
+        "Depois de autorizar, você será redirecionado para uma página que *não vai carregar*. "
+        "Isso é normal! Copie a URL completa da barra de endereço e cole aqui.",
+        parse_mode="Markdown",
+    )
+
+    return WAITING_AUTH_URL
+
+
+async def cmd_auth_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    redirect_url = update.message.text.strip()
+    flow = context.user_data.get("auth_flow")
+    user_id = context.user_data.get("user_id")
+
+    if not flow or not user_id:
+        await update.message.reply_text("Algo deu errado. Tente /auth novamente.")
+        return ConversationHandler.END
+
+    try:
+        complete_auth(flow, redirect_url, user_id)
+        await update.message.reply_text(
+            f"✅ Conta Google conectada com sucesso, {user_id}! "
+            "Agora você pode usar /eventos e /criar."
+        )
+    except Exception as e:
+        logger.error(f"Erro na autenticação de {user_id}: {e}")
+        await update.message.reply_text(
+            "Erro ao processar a URL. Verifique se copiou a URL completa e tente /auth novamente."
+        )
+
+    return ConversationHandler.END
+
+
+async def cmd_auth_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Autenticação cancelada.")
+    return ConversationHandler.END
 
 
 async def cmd_eventos(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -113,6 +183,17 @@ async def cmd_criar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def create_bot(token: str) -> Application:
     app = Application.builder().token(token).build()
 
+    auth_handler = ConversationHandler(
+        entry_points=[CommandHandler("auth", cmd_auth_start)],
+        states={
+            WAITING_AUTH_URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_auth_receive_url),
+            ],
+        },
+        fallbacks=[CommandHandler("cancelar", cmd_auth_cancel)],
+    )
+
+    app.add_handler(auth_handler)
     app.add_handler(CommandHandler("ajuda", cmd_ajuda))
     app.add_handler(CommandHandler("start", cmd_ajuda))
     app.add_handler(CommandHandler("eventos", cmd_eventos))

@@ -1,11 +1,15 @@
 """
-Script para autenticar a conta Google de um usuário.
+Script para autenticar a conta Google de um usuário localmente.
 Uso: python -m src.auth <nome_do_usuario>
+
+Para autenticação remota, use o comando /auth no Telegram.
 """
 
 import sys
 
-from src.calendar_api import get_calendar_service
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+from src.calendar_api import SCOPES, CREDENTIALS_PATH, get_token_path
 
 
 def main():
@@ -18,9 +22,14 @@ def main():
     print(f"Autenticando usuário: {user_id}")
     print("Uma janela do navegador vai abrir. Faça login na conta Google e autorize o acesso.")
 
-    get_calendar_service(user_id)
+    flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+    creds = flow.run_local_server(port=0)
 
-    print(f"Autenticação concluída! Token salvo em tokens/{user_id}.json")
+    token_path = get_token_path(user_id)
+    with open(token_path, "w") as token_file:
+        token_file.write(creds.to_json())
+
+    print(f"Autenticação concluída! Token salvo em {token_path}")
 
 
 if __name__ == "__main__":
