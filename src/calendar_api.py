@@ -11,6 +11,7 @@ from googleapiclient.discovery import build
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/tasks",
 ]
 TOKENS_DIR = os.path.join(os.path.dirname(__file__), "..", "tokens")
 CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "..", "credentials.json")
@@ -339,6 +340,73 @@ def format_weekly_summary(user_id: str) -> str:
     return "\n".join(lines)
 
 
+def get_tasks_service(user_id: str):
+    token_path = get_token_path(user_id)
+    creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+
+    return build("tasks", "v1", credentials=creds)
+
+
+# --- Tarefas (Google Tasks) ---
+
+def list_task_lists(user_id: str) -> list[dict]:
+    service = get_tasks_service(user_id)
+    result = service.tasklists().list().execute()
+    return [
+        {"id": tl["id"], "name": tl.get("title", "Sem nome")}
+        for tl in result.get("items", [])
+    ]
+
+
+def get_tasks(user_id: str, task_list_id: str = "@default", show_completed: bool = False) -> list[dict]:
+    service = get_tasks_service(user_id)
+    result = service.tasks().list(
+        tasklist=task_list_id,
+        showCompleted=show_completed,
+        showHidden=False,
+    ).execute()
+    return result.get("items", [])
+
+
+def create_task(user_id: str, title: str, due_date: str = None, task_list_id: str = "@default") -> dict:
+    service = get_tasks_service(user_id)
+
+    task = {"title": title}
+
+    if due_date:
+        dt = datetime.strptime(due_date, "%d/%m/%Y")
+        task["due"] = dt.strftime("%Y-%m-%dT00:00:00.000Z")
+
+    created = service.tasks().insert(tasklist=task_list_id, body=task).execute()
+    return created
+
+
+def complete_task(user_id: str, task_id: str, task_list_id: str = "@default"):
+    service = get_tasks_service(user_id)
+    task = service.tasks().get(tasklist=task_list_id, task=task_id).execute()
+    task["status"] = "completed"
+    service.tasks().update(tasklist=task_list_id, task=task_id, body=task).execute()
+
+
+def delete_task(user_id: str, task_id: str, task_list_id: str = "@default"):
+    service = get_tasks_service(user_id)
+    service.tasks().delete(tasklist=task_list_id, task=task_id).execute()
+
+
+def format_task(task: dict) -> str:
+    title = task.get("title", "Sem título")
+    status = "✅" if task.get("status") == "completed" else "⬜"
+    due = task.get("due")
+    if due:
+        dt = datetime.fromisoformat(due.replace("Z", "+00:00"))
+        return f"{status} {title} — até {dt.strftime('%d/%m/%Y')}"
+    return f"{status} {title}"
+
+
 def format_daily_summary(user_id: str) -> str:
     tz = get_timezone()
     today = datetime.now(tz).date()
@@ -347,11 +415,23 @@ def format_daily_summary(user_id: str) -> str:
 
     events = get_events_for_date(user_id, today)
 
-    if not events:
-        return f"☀️ *Bom dia! {day_name}, {date_str}*\n\nNenhum evento hoje. Dia livre!"
-
     lines = [f"☀️ *Bom dia! {day_name}, {date_str}*\n"]
-    for ev in events:
-        lines.append(format_event_short(ev))
+
+    if events:
+        lines.append("📅 *Eventos:*")
+        for ev in events:
+            lines.append(format_event_short(ev))
+    else:
+        lines.append("📅 Nenhum evento hoje.")
+
+    try:
+        tasks = get_tasks(user_id)
+        pending = [t for t in tasks if t.get("status") != "completed"]
+        if pending:
+            lines.append("\n📝 *Tarefas pendentes:*")
+            for t in pending:
+                lines.append(f"  {format_task(t)}")
+    except Exception:
+        pass
 
     return "\n".join(lines)

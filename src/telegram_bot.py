@@ -30,6 +30,11 @@ from src.calendar_api import (
     generate_auth_url,
     complete_auth,
     get_timezone,
+    get_tasks,
+    create_task,
+    complete_task,
+    delete_task,
+    format_task,
     DAYS_PT,
 )
 
@@ -120,16 +125,24 @@ async def check_user(update: Update) -> str | None:
 async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📋 *Comandos disponíveis:*\n\n"
+        "*Agenda:*\n"
         "/auth — Cadastra e conecta sua conta Google\n"
-        "/eventos — Lista os próximos eventos da agenda\n"
-        "/criar <título> <dd/mm/aaaa> <hh:mm> — Cria um novo evento\n"
-        "/excluir — Exclui um evento da agenda\n"
-        "/livre — Mostra horários vagos de hoje\n"
+        "/eventos — Lista os próximos eventos\n"
+        "/criar <título> <dd/mm/aaaa> <hh:mm> — Cria evento\n"
+        "/excluir — Exclui um evento\n"
+        "/livre — Horários vagos de hoje\n"
         "/semana — Programação da semana\n"
-        "/semana\\_casal — Agenda da semana do casal\n"
-        "/aniversarios — Aniversários dos próximos 7 dias\n"
-        "/silencio <horas> — Pausa lembretes por X horas\n"
-        "/ativar — Reativa os lembretes\n"
+        "/semana\\_casal — Agenda do casal\n"
+        "/aniversarios — Aniversários da semana\n\n"
+        "*Tarefas:*\n"
+        "/tarefas — Lista tarefas pendentes\n"
+        "/nova\\_tarefa <título> — Cria tarefa\n"
+        "/nova\\_tarefa <título> <dd/mm/aaaa> — Cria tarefa com prazo\n"
+        "/concluir — Marca tarefa como concluída\n"
+        "/excluir\\_tarefa — Remove uma tarefa\n\n"
+        "*Outros:*\n"
+        "/silencio <horas> — Pausa lembretes\n"
+        "/ativar — Reativa lembretes\n"
         "/ajuda — Mostra esta mensagem"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -504,6 +517,172 @@ async def cmd_aniversarios(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+# --- /tarefas ---
+
+async def cmd_tarefas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = await check_user(update)
+    if not user_id:
+        return
+
+    try:
+        tasks = get_tasks(user_id)
+        pending = [t for t in tasks if t.get("status") != "completed"]
+    except Exception as e:
+        logger.error(f"Erro ao buscar tarefas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar as tarefas. Tente novamente.")
+        return
+
+    if not pending:
+        await update.message.reply_text("Nenhuma tarefa pendente!")
+        return
+
+    lines = ["📝 *Tarefas pendentes:*\n"]
+    for t in pending:
+        lines.append(f"  {format_task(t)}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# --- /nova_tarefa ---
+
+async def cmd_nova_tarefa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = await check_user(update)
+    if not user_id:
+        return
+
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "Uso: /nova_tarefa <título>\n"
+            "Ou: /nova_tarefa <título> <dd/mm/aaaa>\n"
+            "Exemplo: /nova_tarefa Comprar presente 15/04/2026"
+        )
+        return
+
+    due_date = None
+    try:
+        datetime.strptime(args[-1], "%d/%m/%Y")
+        due_date = args[-1]
+        title = " ".join(args[:-1])
+    except ValueError:
+        title = " ".join(args)
+
+    if not title:
+        await update.message.reply_text("Informe o título da tarefa.")
+        return
+
+    try:
+        created = create_task(user_id, title, due_date)
+        text = f"✅ Tarefa criada: {created.get('title', title)}"
+        if due_date:
+            text += f" (prazo: {due_date})"
+        await update.message.reply_text(text)
+    except Exception as e:
+        logger.error(f"Erro ao criar tarefa para {user_id}: {e}")
+        await update.message.reply_text("Erro ao criar tarefa. Tente novamente.")
+
+
+# --- /concluir ---
+
+async def cmd_concluir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = await check_user(update)
+    if not user_id:
+        return
+
+    try:
+        tasks = get_tasks(user_id)
+        pending = [t for t in tasks if t.get("status") != "completed"]
+    except Exception as e:
+        logger.error(f"Erro ao buscar tarefas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar as tarefas. Tente novamente.")
+        return
+
+    if not pending:
+        await update.message.reply_text("Nenhuma tarefa pendente para concluir!")
+        return
+
+    buttons = [
+        [InlineKeyboardButton(t.get("title", "Sem título"), callback_data=f"done:{t['id']}")]
+        for t in pending[:15]
+    ]
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        "✅ Qual tarefa deseja concluir?",
+        reply_markup=keyboard,
+    )
+
+
+async def callback_complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    telegram_id = query.from_user.id
+    user_id = get_user_id(telegram_id)
+    if not user_id:
+        await query.edit_message_text("Erro: usuário não encontrado.")
+        return
+
+    task_id = query.data.replace("done:", "", 1)
+
+    try:
+        complete_task(user_id, task_id)
+        await query.edit_message_text("✅ Tarefa concluída!")
+    except Exception as e:
+        logger.error(f"Erro ao concluir tarefa para {user_id}: {e}")
+        await query.edit_message_text("Erro ao concluir tarefa. Tente novamente.")
+
+
+# --- /excluir_tarefa ---
+
+async def cmd_excluir_tarefa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = await check_user(update)
+    if not user_id:
+        return
+
+    try:
+        tasks = get_tasks(user_id)
+        pending = [t for t in tasks if t.get("status") != "completed"]
+    except Exception as e:
+        logger.error(f"Erro ao buscar tarefas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar as tarefas. Tente novamente.")
+        return
+
+    if not pending:
+        await update.message.reply_text("Nenhuma tarefa para excluir!")
+        return
+
+    buttons = [
+        [InlineKeyboardButton(t.get("title", "Sem título"), callback_data=f"deltask:{t['id']}")]
+        for t in pending[:15]
+    ]
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        "🗑️ Qual tarefa deseja excluir?",
+        reply_markup=keyboard,
+    )
+
+
+async def callback_delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    telegram_id = query.from_user.id
+    user_id = get_user_id(telegram_id)
+    if not user_id:
+        await query.edit_message_text("Erro: usuário não encontrado.")
+        return
+
+    task_id = query.data.replace("deltask:", "", 1)
+
+    try:
+        delete_task(user_id, task_id)
+        await query.edit_message_text("✅ Tarefa excluída!")
+    except Exception as e:
+        logger.error(f"Erro ao excluir tarefa para {user_id}: {e}")
+        await query.edit_message_text("Erro ao excluir tarefa. Tente novamente.")
+
+
 # --- /silencio e /ativar ---
 
 async def cmd_silencio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -563,9 +742,15 @@ def create_bot(token: str) -> Application:
     app.add_handler(CommandHandler("semana", cmd_semana))
     app.add_handler(CommandHandler("semana_casal", cmd_semana_casal))
     app.add_handler(CommandHandler("aniversarios", cmd_aniversarios))
+    app.add_handler(CommandHandler("tarefas", cmd_tarefas))
+    app.add_handler(CommandHandler("nova_tarefa", cmd_nova_tarefa))
+    app.add_handler(CommandHandler("concluir", cmd_concluir))
+    app.add_handler(CommandHandler("excluir_tarefa", cmd_excluir_tarefa))
     app.add_handler(CommandHandler("silencio", cmd_silencio))
     app.add_handler(CommandHandler("ativar", cmd_ativar))
     app.add_handler(CallbackQueryHandler(callback_select_calendar, pattern=r"^cal:"))
     app.add_handler(CallbackQueryHandler(callback_delete_event, pattern=r"^del:"))
+    app.add_handler(CallbackQueryHandler(callback_complete_task, pattern=r"^done:"))
+    app.add_handler(CallbackQueryHandler(callback_delete_task, pattern=r"^deltask:"))
 
     return app
