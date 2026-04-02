@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 
 USERS_PATH = os.path.join(os.path.dirname(__file__), "..", "users.json")
 
-WAITING_AUTH_URL = 0
+WAITING_NAME = 0
+WAITING_AUTH_URL = 1
 
 
 def load_users() -> dict:
@@ -35,9 +36,20 @@ def load_users() -> dict:
         return json.load(f)
 
 
+def save_users(users: dict):
+    with open(USERS_PATH, "w", encoding="utf-8") as f:
+        json.dump(users, f, indent=2, ensure_ascii=False)
+
+
 def get_user_id(telegram_id: int) -> str | None:
     users = load_users()
     return users.get(str(telegram_id), {}).get("name")
+
+
+def register_user(telegram_id: int, name: str):
+    users = load_users()
+    users[str(telegram_id)] = {"name": name}
+    save_users(users)
 
 
 async def check_user(update: Update) -> str | None:
@@ -46,7 +58,7 @@ async def check_user(update: Update) -> str | None:
 
     if not user_id:
         await update.message.reply_text(
-            "Você não está cadastrado. Peça ao administrador para te adicionar no users.json."
+            "Você ainda não está cadastrado. Use /auth para se registrar e conectar sua agenda."
         )
         return None
 
@@ -62,7 +74,7 @@ async def check_user(update: Update) -> str | None:
 async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📋 *Comandos disponíveis:*\n\n"
-        "/auth — Conecta sua conta Google\n"
+        "/auth — Cadastra e conecta sua conta Google\n"
         "/eventos — Lista os próximos eventos da agenda\n"
         "/criar <título> <dd/mm/aaaa> <hh:mm> — Cria um novo evento\n"
         "/ajuda — Mostra esta mensagem"
@@ -74,22 +86,36 @@ async def cmd_auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     user_id = get_user_id(telegram_id)
 
-    if not user_id:
-        await update.message.reply_text(
-            "Você não está cadastrado. Peça ao administrador para te adicionar no users.json."
-        )
-        return ConversationHandler.END
-
-    if is_user_authenticated(user_id):
+    if user_id and is_user_authenticated(user_id):
         await update.message.reply_text("Sua conta Google já está conectada!")
         return ConversationHandler.END
 
+    if user_id:
+        return await send_auth_link(update, context, user_id)
+
+    await update.message.reply_text(
+        "Bem-vindo! Qual é o seu nome? (será usado para identificar sua agenda)"
+    )
+    return WAITING_NAME
+
+
+async def cmd_auth_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip().lower().replace(" ", "_")
+    telegram_id = update.effective_user.id
+
+    register_user(telegram_id, name)
+    logger.info(f"Novo usuário registrado: {name} (Telegram ID: {telegram_id})")
+
+    return await send_auth_link(update, context, name)
+
+
+async def send_auth_link(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str):
     flow, auth_url = generate_auth_url()
     context.user_data["auth_flow"] = flow
     context.user_data["user_id"] = user_id
 
     await update.message.reply_text(
-        "🔗 Clique no link abaixo para conectar sua conta Google:\n\n"
+        f"Olá, *{user_id}*! 🔗 Clique no link abaixo para conectar sua conta Google:\n\n"
         f"{auth_url}\n\n"
         "Depois de autorizar, você será redirecionado para uma página que *não vai carregar*. "
         "Isso é normal! Copie a URL completa da barra de endereço e cole aqui.",
@@ -186,6 +212,9 @@ def create_bot(token: str) -> Application:
     auth_handler = ConversationHandler(
         entry_points=[CommandHandler("auth", cmd_auth_start)],
         states={
+            WAITING_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_auth_receive_name),
+            ],
             WAITING_AUTH_URL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_auth_receive_url),
             ],
