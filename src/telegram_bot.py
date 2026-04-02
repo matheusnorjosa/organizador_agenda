@@ -196,38 +196,15 @@ async def cmd_auth_receive_name(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def send_auth_link(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str):
-    # Tenta fluxo automático (servidor local captura o redirect)
-    flow_local, auth_url_local = generate_auth_url(local=True)
+    flow, auth_url = generate_auth_url(local=False)
+    context.user_data["auth_flow"] = flow
     context.user_data["user_id"] = user_id
 
     await update.message.reply_text(
         f"Olá, {user_id}! 🔗 Clique no link abaixo para conectar sua conta Google:\n\n"
-        f"{auth_url_local}\n\n"
-        "Após autorizar, a página vai confirmar automaticamente. "
-        "Aguardando autenticação..."
-    )
-
-    # Roda o servidor local em background para capturar o callback
-    import asyncio
-    loop = asyncio.get_event_loop()
-    success = await loop.run_in_executor(None, wait_for_callback, flow_local, user_id, 30)
-
-    if success:
-        await update.message.reply_text(
-            f"✅ Conta Google conectada com sucesso, {user_id}! "
-            "Agora você pode usar todos os comandos."
-        )
-        return ConversationHandler.END
-
-    # Se o servidor local não captou (ex: usuário remoto), oferece fluxo manual
-    flow_remote, auth_url_remote = generate_auth_url(local=False)
-    context.user_data["auth_flow"] = flow_remote
-
-    await update.message.reply_text(
-        "⏱️ Não consegui capturar a autenticação automaticamente.\n\n"
-        "Se você está em outro dispositivo, clique neste link:\n\n"
-        f"{auth_url_remote}\n\n"
-        "Depois de autorizar, copie a URL completa da barra de endereço e cole aqui."
+        f"{auth_url}\n\n"
+        "Depois de autorizar, você será redirecionado para uma página que não vai carregar. "
+        "Isso é normal! Copie a URL completa da barra de endereço e cole aqui."
     )
 
     return WAITING_AUTH_URL
