@@ -210,7 +210,7 @@ async def send_auth_link(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     # Roda o servidor local em background para capturar o callback
     import asyncio
     loop = asyncio.get_event_loop()
-    success = await loop.run_in_executor(None, wait_for_callback, flow_local, user_id, 120)
+    success = await loop.run_in_executor(None, wait_for_callback, flow_local, user_id, 30)
 
     if success:
         await update.message.reply_text(

@@ -112,7 +112,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass  # silencia logs do servidor
 
 
-def wait_for_callback(flow: Flow, user_id: str, timeout: int = 120) -> bool:
+def wait_for_callback(flow: Flow, user_id: str, timeout: int = 30) -> bool:
     _CallbackHandler.auth_code = None
     server = HTTPServer(("localhost", CALLBACK_PORT), _CallbackHandler)
     server.timeout = timeout
