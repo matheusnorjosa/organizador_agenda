@@ -196,8 +196,10 @@ async def cmd_auth_receive_url(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     except Exception as e:
         logger.error(f"Erro na autenticação de {user_id}: {e}")
+        logger.error(f"URL recebida: {redirect_url}")
         await update.message.reply_text(
-            "Erro ao processar a URL. Verifique se copiou a URL completa e tente /auth novamente."
+            f"Erro ao processar a URL: {e}\n\n"
+            "Verifique se copiou a URL completa da barra de endereço e tente /auth novamente."
         )
 
     return ConversationHandler.END
