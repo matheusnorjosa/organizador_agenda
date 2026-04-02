@@ -170,11 +170,10 @@ async def send_auth_link(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     context.user_data["user_id"] = user_id
 
     await update.message.reply_text(
-        f"Olá, *{user_id}*! 🔗 Clique no link abaixo para conectar sua conta Google:\n\n"
+        f"Olá, {user_id}! 🔗 Clique no link abaixo para conectar sua conta Google:\n\n"
         f"{auth_url}\n\n"
-        "Depois de autorizar, você será redirecionado para uma página que *não vai carregar*. "
+        "Depois de autorizar, você será redirecionado para uma página que não vai carregar. "
         "Isso é normal! Copie a URL completa da barra de endereço e cole aqui.",
-        parse_mode="Markdown",
     )
 
     return WAITING_AUTH_URL
