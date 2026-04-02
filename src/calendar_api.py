@@ -1,5 +1,9 @@
+import json
+import logging
 import os
+import threading
 from datetime import datetime, timedelta, date, time as dt_time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from zoneinfo import ZoneInfo
 
@@ -8,6 +12,8 @@ from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
+logger = logging.getLogger(__name__)
+
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/contacts.readonly",
@@ -15,7 +21,9 @@ SCOPES = [
 ]
 TOKENS_DIR = os.path.join(os.path.dirname(__file__), "..", "tokens")
 CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "..", "credentials.json")
-REDIRECT_URI = "http://localhost:1"
+CALLBACK_PORT = 8095
+REDIRECT_URI_LOCAL = f"http://localhost:{CALLBACK_PORT}"
+REDIRECT_URI_REMOTE = "http://localhost:1"
 
 DAYS_PT = {
     0: "Segunda-feira",
@@ -37,11 +45,12 @@ def get_token_path(user_id: str) -> str:
     return os.path.join(TOKENS_DIR, f"{user_id}.json")
 
 
-def generate_auth_url() -> tuple[Flow, str]:
+def generate_auth_url(local: bool = True) -> tuple[Flow, str]:
+    redirect_uri = REDIRECT_URI_LOCAL if local else REDIRECT_URI_REMOTE
     flow = Flow.from_client_secrets_file(
         CREDENTIALS_PATH,
         scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
+        redirect_uri=redirect_uri,
     )
     auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
     return flow, auth_url
@@ -62,6 +71,80 @@ def complete_auth(flow: Flow, redirect_url: str, user_id: str):
         token_file.write(creds.to_json())
 
     return creds
+
+
+def complete_auth_with_code(flow: Flow, code: str, user_id: str):
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+
+    token_path = get_token_path(user_id)
+    with open(token_path, "w") as token_file:
+        token_file.write(creds.to_json())
+
+    return creds
+
+
+class _CallbackHandler(BaseHTTPRequestHandler):
+    auth_code = None
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        code = params.get("code", [None])[0]
+
+        if code:
+            _CallbackHandler.auth_code = code
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                "<html><body style='font-family:sans-serif;text-align:center;padding:50px'>"
+                "<h1>✅ Autenticação concluída!</h1>"
+                "<p>Pode fechar esta página e voltar ao Telegram.</p>"
+                "</body></html>".encode("utf-8")
+            )
+        else:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"Erro na autenticacao.")
+
+    def log_message(self, format, *args):
+        pass  # silencia logs do servidor
+
+
+def wait_for_callback(flow: Flow, user_id: str, timeout: int = 120) -> bool:
+    _CallbackHandler.auth_code = None
+    server = HTTPServer(("localhost", CALLBACK_PORT), _CallbackHandler)
+    server.timeout = timeout
+
+    def serve():
+        server.handle_request()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout + 5)
+
+    server.server_close()
+
+    if _CallbackHandler.auth_code:
+        complete_auth_with_code(flow, _CallbackHandler.auth_code, user_id)
+        return True
+    return False
+
+
+# --- Verificação de escopos ---
+
+def check_scopes(user_id: str) -> list[str]:
+    token_path = get_token_path(user_id)
+    if not os.path.exists(token_path):
+        return SCOPES
+
+    with open(token_path, "r") as f:
+        token_data = json.load(f)
+
+    current_scopes = token_data.get("scopes", [])
+    missing = [s for s in SCOPES if s not in current_scopes]
+    return missing
 
 
 def get_calendar_service(user_id: str):

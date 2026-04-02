@@ -29,6 +29,8 @@ from src.calendar_api import (
     is_user_authenticated,
     generate_auth_url,
     complete_auth,
+    wait_for_callback,
+    check_scopes,
     get_timezone,
     get_tasks,
     create_task,
@@ -117,6 +119,14 @@ async def check_user(update: Update) -> str | None:
         )
         return None
 
+    missing = check_scopes(user_id)
+    if missing:
+        await update.message.reply_text(
+            "⚠️ Novas permissões foram adicionadas ao bot. "
+            "Use /auth novamente para atualizar o acesso à sua conta Google."
+        )
+        return None
+
     return user_id
 
 
@@ -154,11 +164,19 @@ async def cmd_auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     user_id = get_user_id(telegram_id)
 
+    needs_reauth = False
     if user_id and is_user_authenticated(user_id):
-        await update.message.reply_text("Sua conta Google já está conectada!")
-        return ConversationHandler.END
+        missing = check_scopes(user_id)
+        if not missing:
+            await update.message.reply_text("Sua conta Google já está conectada!")
+            return ConversationHandler.END
+        needs_reauth = True
 
     if user_id:
+        if needs_reauth:
+            await update.message.reply_text(
+                "⚠️ Novas permissões foram adicionadas. Vamos atualizar sua conexão."
+            )
         return await send_auth_link(update, context, user_id)
 
     await update.message.reply_text(
@@ -178,15 +196,38 @@ async def cmd_auth_receive_name(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def send_auth_link(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str):
-    flow, auth_url = generate_auth_url()
-    context.user_data["auth_flow"] = flow
+    # Tenta fluxo automático (servidor local captura o redirect)
+    flow_local, auth_url_local = generate_auth_url(local=True)
     context.user_data["user_id"] = user_id
 
     await update.message.reply_text(
         f"Olá, {user_id}! 🔗 Clique no link abaixo para conectar sua conta Google:\n\n"
-        f"{auth_url}\n\n"
-        "Depois de autorizar, você será redirecionado para uma página que não vai carregar. "
-        "Isso é normal! Copie a URL completa da barra de endereço e cole aqui.",
+        f"{auth_url_local}\n\n"
+        "Após autorizar, a página vai confirmar automaticamente. "
+        "Aguardando autenticação..."
+    )
+
+    # Roda o servidor local em background para capturar o callback
+    import asyncio
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(None, wait_for_callback, flow_local, user_id, 120)
+
+    if success:
+        await update.message.reply_text(
+            f"✅ Conta Google conectada com sucesso, {user_id}! "
+            "Agora você pode usar todos os comandos."
+        )
+        return ConversationHandler.END
+
+    # Se o servidor local não captou (ex: usuário remoto), oferece fluxo manual
+    flow_remote, auth_url_remote = generate_auth_url(local=False)
+    context.user_data["auth_flow"] = flow_remote
+
+    await update.message.reply_text(
+        "⏱️ Não consegui capturar a autenticação automaticamente.\n\n"
+        "Se você está em outro dispositivo, clique neste link:\n\n"
+        f"{auth_url_remote}\n\n"
+        "Depois de autorizar, copie a URL completa da barra de endereço e cole aqui."
     )
 
     return WAITING_AUTH_URL
@@ -205,7 +246,7 @@ async def cmd_auth_receive_url(update: Update, context: ContextTypes.DEFAULT_TYP
         complete_auth(flow, redirect_url, user_id)
         await update.message.reply_text(
             f"✅ Conta Google conectada com sucesso, {user_id}! "
-            "Agora você pode usar /eventos e /criar."
+            "Agora você pode usar todos os comandos."
         )
     except Exception as e:
         logger.error(f"Erro na autenticação de {user_id}: {e}")
