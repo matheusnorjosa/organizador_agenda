@@ -5,6 +5,7 @@ import os
 from telegram import Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -12,10 +13,13 @@ from telegram.ext import (
     filters,
 )
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
 from src.calendar_api import (
     get_events,
     create_event,
     format_event,
+    list_calendars,
     is_user_authenticated,
     generate_auth_url,
     complete_auth,
@@ -194,16 +198,79 @@ async def cmd_criar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = " ".join(args[:-2])
 
     try:
-        created = create_event(user_id, title, date_str, time_str)
-        summary = created.get("summary", title)
-        await update.message.reply_text(f"✅ Evento criado: {summary} em {date_str} às {time_str}")
-    except ValueError:
-        await update.message.reply_text(
-            "Formato inválido. Use: /criar <título> <dd/mm/aaaa> <hh:mm>"
+        calendars = list_calendars(user_id)
+    except Exception as e:
+        logger.error(f"Erro ao listar agendas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar suas agendas. Tente novamente.")
+        return
+
+    context.user_data["pending_event"] = {
+        "title": title,
+        "date": date_str,
+        "time": time_str,
+    }
+
+    if len(calendars) == 1:
+        return await create_event_in_calendar(
+            update, context, user_id, calendars[0]["id"], title, date_str, time_str
         )
+
+    buttons = [
+        [InlineKeyboardButton(cal["name"], callback_data=f"cal:{cal['id']}")]
+        for cal in calendars
+    ]
+    keyboard = InlineKeyboardMarkup(buttons)
+
+    await update.message.reply_text(
+        f"📅 Em qual agenda deseja criar *{title}*?",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+
+
+async def callback_select_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    telegram_id = query.from_user.id
+    user_id = get_user_id(telegram_id)
+    if not user_id:
+        await query.edit_message_text("Erro: usuário não encontrado.")
+        return
+
+    calendar_id = query.data.replace("cal:", "", 1)
+    pending = context.user_data.get("pending_event")
+
+    if not pending:
+        await query.edit_message_text("Erro: nenhum evento pendente. Use /criar novamente.")
+        return
+
+    await create_event_in_calendar(
+        update, context, user_id, calendar_id,
+        pending["title"], pending["date"], pending["time"],
+        edit_message=query,
+    )
+
+
+async def create_event_in_calendar(
+    update, context, user_id, calendar_id, title, date_str, time_str, edit_message=None,
+):
+    try:
+        created = create_event(user_id, title, date_str, time_str, calendar_id=calendar_id)
+        summary = created.get("summary", title)
+        text = f"✅ Evento criado: {summary} em {date_str} às {time_str}"
+    except ValueError:
+        text = "Formato inválido. Use: /criar <título> <dd/mm/aaaa> <hh:mm>"
     except Exception as e:
         logger.error(f"Erro ao criar evento para {user_id}: {e}")
-        await update.message.reply_text("Erro ao criar evento. Tente novamente.")
+        text = "Erro ao criar evento. Tente novamente."
+
+    context.user_data.pop("pending_event", None)
+
+    if edit_message:
+        await edit_message.edit_message_text(text)
+    else:
+        await update.message.reply_text(text)
 
 
 def create_bot(token: str) -> Application:
@@ -227,5 +294,6 @@ def create_bot(token: str) -> Application:
     app.add_handler(CommandHandler("start", cmd_ajuda))
     app.add_handler(CommandHandler("eventos", cmd_eventos))
     app.add_handler(CommandHandler("criar", cmd_criar))
+    app.add_handler(CallbackQueryHandler(callback_select_calendar, pattern=r"^cal:"))
 
     return app

@@ -88,7 +88,21 @@ def get_events(user_id: str, days_ahead: int = 1) -> list[dict]:
     return result.get("items", [])
 
 
-def create_event(user_id: str, title: str, date: str, time: str, duration_minutes: int = 60) -> dict:
+def list_calendars(user_id: str) -> list[dict]:
+    service = get_calendar_service(user_id)
+    result = service.calendarList().list().execute()
+    calendars = result.get("items", [])
+    return [
+        {"id": cal["id"], "name": cal.get("summary", "Sem nome")}
+        for cal in calendars
+        if cal.get("accessRole") in ("owner", "writer")
+    ]
+
+
+def create_event(
+    user_id: str, title: str, date: str, time: str,
+    calendar_id: str = "primary", duration_minutes: int = 60,
+) -> dict:
     service = get_calendar_service(user_id)
 
     start_dt = datetime.strptime(f"{date} {time}", "%d/%m/%Y %H:%M")
@@ -108,7 +122,7 @@ def create_event(user_id: str, title: str, date: str, time: str, duration_minute
         },
     }
 
-    created = service.events().insert(calendarId="primary", body=event).execute()
+    created = service.events().insert(calendarId=calendar_id, body=event).execute()
     return created
 
 
