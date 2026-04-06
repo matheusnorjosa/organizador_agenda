@@ -1,15 +1,13 @@
 import asyncio
-import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, date
 
 from dotenv import load_dotenv
 
 from src.calendar_api import (
     get_events,
     format_event,
-    format_event_short,
     format_weekly_summary,
     format_daily_summary,
     get_upcoming_birthdays,
@@ -32,6 +30,28 @@ DAILY_SUMMARY_HOUR = 7
 WEEKLY_SUMMARY_HOUR = 20
 WEEKLY_SUMMARY_DAY = 6  # domingo
 
+# Controle para não enviar notificações duplicadas
+sent_notifications: set[str] = set()
+sent_event_reminders: set[str] = set()
+
+
+def notification_key(notification_type: str, user_id: str, hour: int) -> str:
+    today = date.today().isoformat()
+    return f"{notification_type}:{user_id}:{today}:{hour}"
+
+
+def event_reminder_key(user_id: str, event_id: str) -> str:
+    return f"event:{user_id}:{event_id}"
+
+
+def cleanup_old_keys():
+    """Remove chaves de dias anteriores para não acumular memória."""
+    today = date.today().isoformat()
+    old_keys = {k for k in sent_notifications if today not in k}
+    sent_notifications.difference_update(old_keys)
+    old_event_keys = {k for k in sent_event_reminders if today not in k}
+    sent_event_reminders.difference_update(old_event_keys)
+
 
 async def send_message(bot, chat_id: str, text: str):
     await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
@@ -53,6 +73,10 @@ async def check_reminders(app):
         if is_user_silenced(int(telegram_id)):
             continue
 
+        key = notification_key("reminder", user_id, current_hour)
+        if key in sent_notifications:
+            continue
+
         try:
             today_events = get_events(user_id, days_ahead=1)
             if today_events:
@@ -66,6 +90,8 @@ async def check_reminders(app):
                 lines = [format_event(ev) for ev in tomorrow_only]
                 text = "🔔 *Eventos de amanhã*\n\n" + "\n".join(lines)
                 await send_message(bot, telegram_id, text)
+
+            sent_notifications.add(key)
 
         except Exception as e:
             logger.error(f"Erro ao verificar eventos de {user_id}: {e}")
@@ -93,14 +119,20 @@ async def check_upcoming_events(app):
                 if "dateTime" not in start:
                     continue
 
+                event_id = ev.get("id", "")
+                key = event_reminder_key(user_id, event_id)
+                if key in sent_event_reminders:
+                    continue
+
                 event_start = datetime.fromisoformat(start["dateTime"]).astimezone(tz)
                 diff = (event_start - now).total_seconds() / 60
 
-                if 15 <= diff <= 30:
+                if 0 <= diff <= 30:
                     summary = ev.get("summary", "Sem título")
                     time_str = event_start.strftime("%H:%M")
                     text = f"⏰ *Lembrete:* {summary} começa às {time_str} (em ~{int(diff)} min)"
                     await send_message(bot, telegram_id, text)
+                    sent_event_reminders.add(key)
 
         except Exception as e:
             logger.error(f"Erro ao verificar próximos eventos de {user_id}: {e}")
@@ -122,9 +154,14 @@ async def check_daily_summary(app):
         if is_user_silenced(int(telegram_id)):
             continue
 
+        key = notification_key("daily", user_id, current_hour)
+        if key in sent_notifications:
+            continue
+
         try:
             text = format_daily_summary(user_id)
             await send_message(bot, telegram_id, text)
+            sent_notifications.add(key)
         except Exception as e:
             logger.error(f"Erro ao enviar resumo diário para {user_id}: {e}")
 
@@ -145,6 +182,10 @@ async def check_weekly_summary(app):
         if is_user_silenced(int(telegram_id)):
             continue
 
+        key = notification_key("weekly", user_id, now.hour)
+        if key in sent_notifications:
+            continue
+
         try:
             text = format_weekly_summary(user_id)
             await send_message(bot, telegram_id, text)
@@ -157,6 +198,8 @@ async def check_weekly_summary(app):
                     lines.append(f"• {bday['name']} — {day_str}")
                 await send_message(bot, telegram_id, "\n".join(lines))
 
+            sent_notifications.add(key)
+
         except Exception as e:
             logger.error(f"Erro ao enviar resumo semanal para {user_id}: {e}")
 
@@ -165,6 +208,7 @@ async def notification_loop(app):
     logger.info("Loop de notificações iniciado")
     while True:
         try:
+            cleanup_old_keys()
             await check_upcoming_events(app)
             await check_reminders(app)
             await check_daily_summary(app)
