@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    container_name: organizador-agenda
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./credentials.json:/app/credentials.json
+      - ./tokens:/app/tokens
+      - ./users.json:/app/users.json
