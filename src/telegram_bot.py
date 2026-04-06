@@ -1098,8 +1098,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.get("name") and is_user_authenticated(data["name"])
     )
 
-    started = bot_stats.get("started_at", "Desconhecido")
-    if started != "Desconhecido":
+    started = bot_stats.get("started_at")
+    if started and isinstance(started, str):
         started_dt = datetime.fromisoformat(started)
         uptime = datetime.now() - started_dt
         hours = int(uptime.total_seconds() / 3600)
