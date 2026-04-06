@@ -1,18 +1,20 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 from dotenv import load_dotenv
 
 from src.calendar_api import (
     get_events,
+    get_events_for_date,
     format_event,
+    format_event_short,
     format_weekly_summary,
     format_daily_summary,
-    get_upcoming_birthdays,
     is_user_authenticated,
     get_timezone,
+    get_upcoming_birthdays,
 )
 from src.telegram_bot import create_bot, load_users, is_user_silenced
 
@@ -24,15 +26,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CHECK_INTERVAL_SECONDS = 60 * 15  # verifica a cada 15 minutos
+CHECK_INTERVAL_SECONDS = 60 * 15
 REMINDER_HOURS = [8, 20]
 DAILY_SUMMARY_HOUR = 7
 WEEKLY_SUMMARY_HOUR = 20
-WEEKLY_SUMMARY_DAY = 6  # domingo
+WEEKLY_SUMMARY_DAY = 6
 
 # Controle para não enviar notificações duplicadas
 sent_notifications: set[str] = set()
 sent_event_reminders: set[str] = set()
+
+# Estatísticas do bot
+bot_stats = {
+    "started_at": None,
+    "last_notification": None,
+    "notifications_sent": 0,
+    "errors_count": 0,
+}
+
+# ID do admin para receber alertas de erro
+ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 def notification_key(notification_type: str, user_id: str, hour: int) -> str:
@@ -45,7 +58,6 @@ def event_reminder_key(user_id: str, event_id: str) -> str:
 
 
 def cleanup_old_keys():
-    """Remove chaves de dias anteriores para não acumular memória."""
     today = date.today().isoformat()
     old_keys = {k for k in sent_notifications if today not in k}
     sent_notifications.difference_update(old_keys)
@@ -55,10 +67,21 @@ def cleanup_old_keys():
 
 async def send_message(bot, chat_id: str, text: str):
     await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    bot_stats["last_notification"] = datetime.now().isoformat()
+    bot_stats["notifications_sent"] += 1
+
+
+async def send_error_alert(bot, error_message: str):
+    if not ADMIN_CHAT_ID:
+        return
+    try:
+        text = f"🚨 *Erro no bot:*\n\n`{error_message[:500]}`"
+        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
+    except Exception:
+        pass
 
 
 async def check_reminders(app):
-    """Lembretes de eventos de hoje e amanhã (8h e 20h)."""
     current_hour = datetime.now().hour
     if current_hour not in REMINDER_HOURS:
         return
@@ -95,10 +118,11 @@ async def check_reminders(app):
 
         except Exception as e:
             logger.error(f"Erro ao verificar eventos de {user_id}: {e}")
+            bot_stats["errors_count"] += 1
+            await send_error_alert(app.bot, f"Erro lembretes ({user_id}): {e}")
 
 
 async def check_upcoming_events(app):
-    """Lembrete de eventos que começam em ~30 minutos."""
     users = load_users()
     bot = app.bot
     tz = get_timezone()
@@ -136,10 +160,10 @@ async def check_upcoming_events(app):
 
         except Exception as e:
             logger.error(f"Erro ao verificar próximos eventos de {user_id}: {e}")
+            bot_stats["errors_count"] += 1
 
 
 async def check_daily_summary(app):
-    """Resumo diário enviado às 7h."""
     current_hour = datetime.now().hour
     if current_hour != DAILY_SUMMARY_HOUR:
         return
@@ -164,10 +188,11 @@ async def check_daily_summary(app):
             sent_notifications.add(key)
         except Exception as e:
             logger.error(f"Erro ao enviar resumo diário para {user_id}: {e}")
+            bot_stats["errors_count"] += 1
+            await send_error_alert(app.bot, f"Erro resumo diário ({user_id}): {e}")
 
 
 async def check_weekly_summary(app):
-    """Resumo semanal enviado no domingo às 20h."""
     now = datetime.now()
     if now.weekday() != WEEKLY_SUMMARY_DAY or now.hour != WEEKLY_SUMMARY_HOUR:
         return
@@ -202,6 +227,89 @@ async def check_weekly_summary(app):
 
         except Exception as e:
             logger.error(f"Erro ao enviar resumo semanal para {user_id}: {e}")
+            bot_stats["errors_count"] += 1
+            await send_error_alert(app.bot, f"Erro resumo semanal ({user_id}): {e}")
+
+
+async def check_couple_conflicts(app):
+    """Verifica conflitos de horário entre os dois usuários."""
+    current_hour = datetime.now().hour
+    if current_hour != DAILY_SUMMARY_HOUR:
+        return
+
+    users = load_users()
+    authenticated = [
+        (tid, data["name"])
+        for tid, data in users.items()
+        if data.get("name") and is_user_authenticated(data["name"])
+    ]
+
+    if len(authenticated) < 2:
+        return
+
+    key = notification_key("conflicts", "couple", current_hour)
+    if key in sent_notifications:
+        return
+
+    tz = get_timezone()
+    today = datetime.now(tz).date()
+
+    # Verifica conflitos para os próximos 3 dias
+    conflicts_found = []
+    for offset in range(3):
+        check_date = today + timedelta(days=offset)
+
+        all_events = {}
+        for tid, uid in authenticated:
+            try:
+                events = get_events_for_date(uid, check_date)
+                all_events[uid] = events
+            except Exception:
+                continue
+
+        if len(all_events) < 2:
+            continue
+
+        user_ids = list(all_events.keys())
+        events_a = all_events[user_ids[0]]
+        events_b = all_events[user_ids[1]]
+
+        for ev_a in events_a:
+            start_a = ev_a.get("start", {})
+            end_a = ev_a.get("end", {})
+            if "dateTime" not in start_a:
+                continue
+
+            a_start = datetime.fromisoformat(start_a["dateTime"]).astimezone(tz)
+            a_end = datetime.fromisoformat(end_a["dateTime"]).astimezone(tz)
+
+            for ev_b in events_b:
+                start_b = ev_b.get("start", {})
+                end_b = ev_b.get("end", {})
+                if "dateTime" not in start_b:
+                    continue
+
+                b_start = datetime.fromisoformat(start_b["dateTime"]).astimezone(tz)
+                b_end = datetime.fromisoformat(end_b["dateTime"]).astimezone(tz)
+
+                if a_start < b_end and b_start < a_end:
+                    day_str = check_date.strftime("%d/%m")
+                    conflicts_found.append(
+                        f"• {day_str}: {ev_a.get('summary', '?')} ({a_start.strftime('%H:%M')}) "
+                        f"x {ev_b.get('summary', '?')} ({b_start.strftime('%H:%M')})"
+                    )
+
+    if conflicts_found:
+        text = "⚠️ *Conflitos de agenda do casal:*\n\n" + "\n".join(conflicts_found)
+        bot = app.bot
+        for tid, uid in authenticated:
+            if not is_user_silenced(int(tid)):
+                try:
+                    await send_message(bot, tid, text)
+                except Exception:
+                    pass
+
+    sent_notifications.add(key)
 
 
 async def notification_loop(app):
@@ -213,8 +321,14 @@ async def notification_loop(app):
             await check_reminders(app)
             await check_daily_summary(app)
             await check_weekly_summary(app)
+            await check_couple_conflicts(app)
         except Exception as e:
             logger.error(f"Erro no loop de notificações: {e}")
+            bot_stats["errors_count"] += 1
+            try:
+                await send_error_alert(app.bot, f"Erro no loop: {e}")
+            except Exception:
+                pass
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
@@ -223,6 +337,8 @@ def main():
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN não configurado no .env")
         return
+
+    bot_stats["started_at"] = datetime.now().isoformat()
 
     app = create_bot(token)
 

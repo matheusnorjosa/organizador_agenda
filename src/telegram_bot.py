@@ -41,6 +41,7 @@ from src.calendar_api import (
     DAYS_PT,
     RECURRENCE_MAP,
 )
+from src.natural_language import parse_event_from_text
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +162,9 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/hoje — Eventos de hoje\n"
         "/amanha — Eventos de amanhã\n"
         "/eventos — Próximos 7 dias\n"
+        "/agendar <texto livre> — Cria evento com IA\n"
         "/criar <título> <data> <hora> — Cria evento\n"
+        "/criar\\_casal <título> <data> <hora> — Cria nas duas agendas\n"
         "/editar — Edita um evento\n"
         "/excluir — Exclui um evento\n"
         "/livre — Horários vagos de hoje\n"
@@ -174,6 +177,7 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/concluir — Marca tarefa como concluída\n"
         "/excluir\\_tarefa — Remove uma tarefa\n\n"
         "*Outros:*\n"
+        "/status — Saúde e estatísticas do bot\n"
         "/silencio <horas> — Pausa lembretes\n"
         "/ativar — Reativa lembretes\n"
         "/ajuda — Mostra esta mensagem"
@@ -936,6 +940,191 @@ async def callback_delete_task(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("Erro ao excluir tarefa. Tente novamente.")
 
 
+# --- /agendar (linguagem natural com IA) ---
+
+async def cmd_agendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = await check_user(update)
+    if not user_id:
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Uso: /agendar <descrição do evento>\n\n"
+            "Exemplos:\n"
+            "/agendar reunião sexta às 14h\n"
+            "/agendar dentista amanhã 10:30\n"
+            "/agendar almoço com mãe domingo meio-dia"
+        )
+        return
+
+    text_input = " ".join(args)
+    await update.message.reply_text("🤖 Interpretando...")
+
+    parsed = await parse_event_from_text(text_input)
+
+    if not parsed:
+        await update.message.reply_text(
+            "Não consegui entender. Tente ser mais específico ou use:\n"
+            "/criar <título> <dd/mm/aaaa> <hh:mm>"
+        )
+        return
+
+    title = parsed["title"]
+    date_str = parsed["date"]
+    time_str = parsed["time"]
+    recurrence = parsed.get("recurrence")
+
+    confirm_text = f"📅 Entendi:\n\n*{title}*\nData: {date_str}\nHorário: {time_str}"
+    if recurrence:
+        confirm_text += f"\nRecorrência: {recurrence}"
+
+    context.user_data["pending_event"] = {
+        "title": title,
+        "date": date_str,
+        "time": time_str,
+        "recurrence": recurrence,
+    }
+
+    buttons = [
+        [
+            InlineKeyboardButton("Confirmar", callback_data="nlconfirm:yes"),
+            InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no"),
+        ]
+    ]
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(confirm_text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+async def callback_nl_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    choice = query.data.replace("nlconfirm:", "", 1)
+
+    if choice == "no":
+        context.user_data.pop("pending_event", None)
+        await query.edit_message_text("Cancelado.")
+        return
+
+    telegram_id = query.from_user.id
+    user_id = get_user_id(telegram_id)
+    if not user_id:
+        await query.edit_message_text("Erro: usuário não encontrado.")
+        return
+
+    pending = context.user_data.get("pending_event")
+    if not pending:
+        await query.edit_message_text("Erro: nenhum evento pendente.")
+        return
+
+    try:
+        created = create_event(
+            user_id, pending["title"], pending["date"], pending["time"],
+            recurrence=pending.get("recurrence"),
+        )
+        summary = created.get("summary", pending["title"])
+        text = f"✅ Evento criado: {summary} em {pending['date']} às {pending['time']}"
+        if pending.get("recurrence"):
+            text += f" ({pending['recurrence']})"
+        await query.edit_message_text(text)
+    except Exception as e:
+        logger.error(f"Erro ao criar evento via IA para {user_id}: {e}")
+        await query.edit_message_text("Erro ao criar evento. Tente novamente.")
+
+    context.user_data.pop("pending_event", None)
+
+
+# --- /criar_casal ---
+
+async def cmd_criar_casal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = await check_user(update)
+    if not user_id:
+        return
+
+    args = context.args
+
+    if not args or len(args) < 3:
+        await update.message.reply_text(
+            "Uso: /criar_casal <título> <dd/mm/aaaa> <hh:mm>\n"
+            "Exemplo: /criar_casal Jantar 10/04/2026 20:00\n\n"
+            "Cria o evento na agenda de todos os usuários."
+        )
+        return
+
+    time_str = args[-1]
+    date_str = args[-2]
+    title = " ".join(args[:-2])
+
+    users = load_users()
+    all_users = [
+        data["name"] for data in users.values()
+        if data.get("name") and is_user_authenticated(data["name"])
+    ]
+
+    if len(all_users) < 2:
+        await update.message.reply_text("Só há um usuário autenticado. Precisa de pelo menos dois!")
+        return
+
+    created_for = []
+    errors_for = []
+
+    for uid in all_users:
+        try:
+            create_event(uid, title, date_str, time_str)
+            created_for.append(uid)
+        except Exception as e:
+            logger.error(f"Erro ao criar evento casal para {uid}: {e}")
+            errors_for.append(uid)
+
+    text = f"👫 Evento *{title}* em {date_str} às {time_str}:\n\n"
+    for uid in created_for:
+        text += f"✅ Criado na agenda de {uid}\n"
+    for uid in errors_for:
+        text += f"❌ Erro na agenda de {uid}\n"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# --- /status ---
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from src.agent import bot_stats
+
+    users = load_users()
+    total_users = len(users)
+    authenticated = sum(
+        1 for data in users.values()
+        if data.get("name") and is_user_authenticated(data["name"])
+    )
+
+    started = bot_stats.get("started_at", "Desconhecido")
+    if started != "Desconhecido":
+        started_dt = datetime.fromisoformat(started)
+        uptime = datetime.now() - started_dt
+        hours = int(uptime.total_seconds() / 3600)
+        minutes = int((uptime.total_seconds() % 3600) / 60)
+        uptime_str = f"{hours}h {minutes}min"
+    else:
+        uptime_str = "Desconhecido"
+
+    last_notif = bot_stats.get("last_notification", "Nenhuma ainda")
+    if last_notif and last_notif != "Nenhuma ainda":
+        last_dt = datetime.fromisoformat(last_notif)
+        last_notif = last_dt.strftime("%d/%m/%Y %H:%M")
+
+    text = (
+        "📊 *Status do Bot*\n\n"
+        f"🟢 *Online* — Uptime: {uptime_str}\n"
+        f"👥 Usuários: {authenticated}/{total_users} autenticados\n"
+        f"📨 Notificações enviadas: {bot_stats.get('notifications_sent', 0)}\n"
+        f"🕐 Última notificação: {last_notif}\n"
+        f"⚠️ Erros: {bot_stats.get('errors_count', 0)}"
+    )
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 # --- /silencio e /ativar ---
 
 async def cmd_silencio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -998,6 +1187,9 @@ def create_bot(token: str) -> Application:
     app.add_handler(CommandHandler("semana", cmd_semana))
     app.add_handler(CommandHandler("semana_casal", cmd_semana_casal))
     app.add_handler(CommandHandler("aniversarios", cmd_aniversarios))
+    app.add_handler(CommandHandler("agendar", cmd_agendar))
+    app.add_handler(CommandHandler("criar_casal", cmd_criar_casal))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("tarefas", cmd_tarefas))
     app.add_handler(CommandHandler("nova_tarefa", cmd_nova_tarefa))
     app.add_handler(CommandHandler("concluir", cmd_concluir))
@@ -1009,6 +1201,7 @@ def create_bot(token: str) -> Application:
     app.add_handler(CallbackQueryHandler(callback_delete_event, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(callback_select_edit, pattern=r"^edit:"))
     app.add_handler(CallbackQueryHandler(callback_select_edit_field, pattern=r"^editfield:"))
+    app.add_handler(CallbackQueryHandler(callback_nl_confirm, pattern=r"^nlconfirm:"))
     app.add_handler(CallbackQueryHandler(callback_complete_task, pattern=r"^done:"))
     app.add_handler(CallbackQueryHandler(callback_confirm_delete_task, pattern=r"^confirmdeltask:"))
     app.add_handler(CallbackQueryHandler(callback_delete_task, pattern=r"^deltask:"))
