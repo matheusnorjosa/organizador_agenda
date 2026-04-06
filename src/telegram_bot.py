@@ -18,9 +18,11 @@ from src.calendar_api import (
     get_events,
     get_events_for_date,
     create_event,
+    update_event,
     delete_event,
     format_event,
     format_event_short,
+    format_events_by_period,
     format_weekly_summary,
     format_daily_summary,
     get_free_slots,
@@ -29,7 +31,6 @@ from src.calendar_api import (
     is_user_authenticated,
     generate_auth_url,
     complete_auth,
-    wait_for_callback,
     check_scopes,
     get_timezone,
     get_tasks,
@@ -38,6 +39,7 @@ from src.calendar_api import (
     delete_task,
     format_task,
     DAYS_PT,
+    RECURRENCE_MAP,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,7 +83,6 @@ def is_user_silenced(telegram_id: int) -> bool:
         return False
     if datetime.fromisoformat(until) > datetime.now():
         return True
-    # Expirou, limpa
     user_data.pop("silenced_until", None)
     save_users(users)
     return False
@@ -130,6 +131,26 @@ async def check_user(update: Update) -> str | None:
     return user_id
 
 
+# --- /start ---
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.effective_user.first_name or "amigo"
+    text = (
+        f"Olá, {name}! 👋\n\n"
+        "Eu sou o *Organizador de Agenda*, seu assistente pessoal no Telegram.\n\n"
+        "Posso te ajudar com:\n"
+        "📅 Gerenciar eventos do Google Calendar\n"
+        "📝 Gerenciar tarefas do Google Tasks\n"
+        "🔔 Enviar lembretes automáticos\n"
+        "🕐 Mostrar horários livres\n"
+        "👫 Agenda compartilhada do casal\n"
+        "🎂 Avisar sobre aniversários\n\n"
+        "Para começar, conecte sua conta Google com /auth\n"
+        "Depois, use /ajuda para ver todos os comandos."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 # --- /ajuda ---
 
 async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -137,8 +158,11 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 *Comandos disponíveis:*\n\n"
         "*Agenda:*\n"
         "/auth — Cadastra e conecta sua conta Google\n"
-        "/eventos — Lista os próximos eventos\n"
-        "/criar <título> <dd/mm/aaaa> <hh:mm> — Cria evento\n"
+        "/hoje — Eventos de hoje\n"
+        "/amanha — Eventos de amanhã\n"
+        "/eventos — Próximos 7 dias\n"
+        "/criar <título> <data> <hora> — Cria evento\n"
+        "/editar — Edita um evento\n"
         "/excluir — Exclui um evento\n"
         "/livre — Horários vagos de hoje\n"
         "/semana — Programação da semana\n"
@@ -147,7 +171,6 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Tarefas:*\n"
         "/tarefas — Lista tarefas pendentes\n"
         "/nova\\_tarefa <título> — Cria tarefa\n"
-        "/nova\\_tarefa <título> <dd/mm/aaaa> — Cria tarefa com prazo\n"
         "/concluir — Marca tarefa como concluída\n"
         "/excluir\\_tarefa — Remove uma tarefa\n\n"
         "*Outros:*\n"
@@ -227,10 +250,9 @@ async def cmd_auth_receive_url(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     except Exception as e:
         logger.error(f"Erro na autenticação de {user_id}: {e}")
-        logger.error(f"URL recebida: {redirect_url}")
         await update.message.reply_text(
             f"Erro ao processar a URL: {e}\n\n"
-            "Verifique se copiou a URL completa da barra de endereço e tente /auth novamente."
+            "Verifique se copiou a URL completa e tente /auth novamente."
         )
 
     return ConversationHandler.END
@@ -239,6 +261,58 @@ async def cmd_auth_receive_url(update: Update, context: ContextTypes.DEFAULT_TYP
 async def cmd_auth_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Autenticação cancelada.")
     return ConversationHandler.END
+
+
+# --- /hoje ---
+
+async def cmd_hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = await check_user(update)
+    if not user_id:
+        return
+
+    tz = get_timezone()
+    today = datetime.now(tz).date()
+    day_name = DAYS_PT[today.weekday()]
+
+    try:
+        events = get_events_for_date(user_id, today)
+    except Exception as e:
+        logger.error(f"Erro ao buscar eventos de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar a agenda. Tente novamente.")
+        return
+
+    if not events:
+        await update.message.reply_text(f"📅 *{day_name}, {today.strftime('%d/%m')}*\n\nNenhum evento hoje. Dia livre!", parse_mode="Markdown")
+        return
+
+    text = f"📅 *{day_name}, {today.strftime('%d/%m')}*\n\n" + format_events_by_period(events)
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# --- /amanha ---
+
+async def cmd_amanha(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = await check_user(update)
+    if not user_id:
+        return
+
+    tz = get_timezone()
+    tomorrow = datetime.now(tz).date() + timedelta(days=1)
+    day_name = DAYS_PT[tomorrow.weekday()]
+
+    try:
+        events = get_events_for_date(user_id, tomorrow)
+    except Exception as e:
+        logger.error(f"Erro ao buscar eventos de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar a agenda. Tente novamente.")
+        return
+
+    if not events:
+        await update.message.reply_text(f"📅 *{day_name}, {tomorrow.strftime('%d/%m')}*\n\nNenhum evento amanhã!", parse_mode="Markdown")
+        return
+
+    text = f"📅 *{day_name}, {tomorrow.strftime('%d/%m')}*\n\n" + format_events_by_period(events)
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # --- /eventos ---
@@ -264,7 +338,7 @@ async def cmd_eventos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# --- /criar ---
+# --- /criar (com suporte a recorrência) ---
 
 async def cmd_criar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = await check_user(update)
@@ -274,15 +348,30 @@ async def cmd_criar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
 
     if not args or len(args) < 3:
+        recurrence_options = ", ".join(RECURRENCE_MAP.keys())
         await update.message.reply_text(
-            "Uso: /criar <título> <dd/mm/aaaa> <hh:mm>\n"
-            "Exemplo: /criar Reunião 10/04/2026 14:00"
+            "Uso: /criar <título> <dd/mm/aaaa> <hh:mm> [recorrência]\n"
+            f"Recorrência (opcional): {recurrence_options}\n\n"
+            "Exemplos:\n"
+            "/criar Reunião 10/04/2026 14:00\n"
+            "/criar Reunião 10/04/2026 14:00 semanal"
         )
         return
 
-    time_str = args[-1]
-    date_str = args[-2]
-    title = " ".join(args[:-2])
+    recurrence = None
+    if args[-1].lower() in RECURRENCE_MAP:
+        recurrence = args[-1].lower()
+        time_str = args[-2]
+        date_str = args[-3]
+        title = " ".join(args[:-3])
+    else:
+        time_str = args[-1]
+        date_str = args[-2]
+        title = " ".join(args[:-2])
+
+    if not title:
+        await update.message.reply_text("Informe o título do evento.")
+        return
 
     try:
         calendars = list_calendars(user_id)
@@ -295,11 +384,12 @@ async def cmd_criar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "title": title,
         "date": date_str,
         "time": time_str,
+        "recurrence": recurrence,
     }
 
     if len(calendars) == 1:
         return await create_event_in_calendar(
-            update, context, user_id, calendars[0]["id"], title, date_str, time_str
+            update, context, user_id, calendars[0]["id"], title, date_str, time_str, recurrence=recurrence
         )
 
     buttons = [
@@ -335,17 +425,21 @@ async def callback_select_calendar(update: Update, context: ContextTypes.DEFAULT
     await create_event_in_calendar(
         update, context, user_id, calendar_id,
         pending["title"], pending["date"], pending["time"],
+        recurrence=pending.get("recurrence"),
         edit_message=query,
     )
 
 
 async def create_event_in_calendar(
-    update, context, user_id, calendar_id, title, date_str, time_str, edit_message=None,
+    update, context, user_id, calendar_id, title, date_str, time_str,
+    recurrence=None, edit_message=None,
 ):
     try:
-        created = create_event(user_id, title, date_str, time_str, calendar_id=calendar_id)
+        created = create_event(user_id, title, date_str, time_str, calendar_id=calendar_id, recurrence=recurrence)
         summary = created.get("summary", title)
         text = f"✅ Evento criado: {summary} em {date_str} às {time_str}"
+        if recurrence:
+            text += f" (recorrência: {recurrence})"
     except ValueError:
         text = "Formato inválido. Use: /criar <título> <dd/mm/aaaa> <hh:mm>"
     except Exception as e:
@@ -360,7 +454,108 @@ async def create_event_in_calendar(
         await update.message.reply_text(text)
 
 
-# --- /excluir ---
+# --- /editar ---
+
+async def cmd_editar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = await check_user(update)
+    if not user_id:
+        return
+
+    try:
+        events = get_events(user_id, days_ahead=30)
+    except Exception as e:
+        logger.error(f"Erro ao buscar eventos de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar a agenda. Tente novamente.")
+        return
+
+    if not events:
+        await update.message.reply_text("Nenhum evento para editar nos próximos 30 dias.")
+        return
+
+    buttons = []
+    for ev in events[:15]:
+        summary = ev.get("summary", "Sem título")
+        start = ev["start"]
+        if "dateTime" in start:
+            dt = datetime.fromisoformat(start["dateTime"])
+            label = f"{summary} — {dt.strftime('%d/%m %H:%M')}"
+        else:
+            label = f"{summary} — {start.get('date', '')}"
+
+        buttons.append(
+            [InlineKeyboardButton(label, callback_data=f"edit:{ev['id']}")]
+        )
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        "✏️ Qual evento deseja editar?",
+        reply_markup=keyboard,
+    )
+
+
+async def callback_select_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    event_id = query.data.replace("edit:", "", 1)
+    context.user_data["editing_event_id"] = event_id
+
+    buttons = [
+        [InlineKeyboardButton("Título", callback_data="editfield:title")],
+        [InlineKeyboardButton("Data", callback_data="editfield:date")],
+        [InlineKeyboardButton("Horário", callback_data="editfield:time")],
+        [InlineKeyboardButton("Cancelar", callback_data="editfield:cancel")],
+    ]
+    keyboard = InlineKeyboardMarkup(buttons)
+    await query.edit_message_text("O que deseja alterar?", reply_markup=keyboard)
+
+
+async def callback_select_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    field = query.data.replace("editfield:", "", 1)
+
+    if field == "cancel":
+        await query.edit_message_text("Edição cancelada.")
+        return
+
+    context.user_data["editing_field"] = field
+
+    prompts = {
+        "title": "Digite o novo título:",
+        "date": "Digite a nova data (dd/mm/aaaa):",
+        "time": "Digite o novo horário (hh:mm):",
+    }
+
+    await query.edit_message_text(prompts[field])
+
+
+async def handle_edit_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    event_id = context.user_data.get("editing_event_id")
+    field = context.user_data.get("editing_field")
+    telegram_id = update.effective_user.id
+    user_id = get_user_id(telegram_id)
+
+    if not event_id or not field or not user_id:
+        return
+
+    value = update.message.text.strip()
+    updates = {field: value}
+
+    try:
+        update_event(user_id, event_id, updates)
+        field_names = {"title": "Título", "date": "Data", "time": "Horário"}
+        await update.message.reply_text(f"✅ {field_names[field]} atualizado para: {value}")
+    except Exception as e:
+        logger.error(f"Erro ao editar evento para {user_id}: {e}")
+        await update.message.reply_text("Erro ao editar evento. Verifique o formato e tente novamente.")
+
+    context.user_data.pop("editing_event_id", None)
+    context.user_data.pop("editing_field", None)
+
+
+# --- /excluir (com confirmação) ---
 
 async def cmd_excluir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = await check_user(update)
@@ -389,7 +584,7 @@ async def cmd_excluir(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = f"{summary} — {start.get('date', '')}"
 
         buttons.append(
-            [InlineKeyboardButton(label, callback_data=f"del:{ev['id']}")]
+            [InlineKeyboardButton(label, callback_data=f"confirmdel:{ev['id']}")]
         )
 
     keyboard = InlineKeyboardMarkup(buttons)
@@ -399,17 +594,37 @@ async def cmd_excluir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def callback_confirm_delete_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    event_id = query.data.replace("confirmdel:", "", 1)
+
+    buttons = [
+        [
+            InlineKeyboardButton("Sim, excluir", callback_data=f"del:{event_id}"),
+            InlineKeyboardButton("Cancelar", callback_data="del:cancel"),
+        ]
+    ]
+    keyboard = InlineKeyboardMarkup(buttons)
+    await query.edit_message_text("Tem certeza que deseja excluir este evento?", reply_markup=keyboard)
+
+
 async def callback_delete_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    event_id = query.data.replace("del:", "", 1)
+
+    if event_id == "cancel":
+        await query.edit_message_text("Exclusão cancelada.")
+        return
 
     telegram_id = query.from_user.id
     user_id = get_user_id(telegram_id)
     if not user_id:
         await query.edit_message_text("Erro: usuário não encontrado.")
         return
-
-    event_id = query.data.replace("del:", "", 1)
 
     try:
         delete_event(user_id, event_id)
@@ -651,7 +866,7 @@ async def callback_complete_task(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("Erro ao concluir tarefa. Tente novamente.")
 
 
-# --- /excluir_tarefa ---
+# --- /excluir_tarefa (com confirmação) ---
 
 async def cmd_excluir_tarefa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = await check_user(update)
@@ -671,7 +886,7 @@ async def cmd_excluir_tarefa(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     buttons = [
-        [InlineKeyboardButton(t.get("title", "Sem título"), callback_data=f"deltask:{t['id']}")]
+        [InlineKeyboardButton(t.get("title", "Sem título"), callback_data=f"confirmdeltask:{t['id']}")]
         for t in pending[:15]
     ]
     keyboard = InlineKeyboardMarkup(buttons)
@@ -681,17 +896,37 @@ async def cmd_excluir_tarefa(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def callback_confirm_delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    task_id = query.data.replace("confirmdeltask:", "", 1)
+
+    buttons = [
+        [
+            InlineKeyboardButton("Sim, excluir", callback_data=f"deltask:{task_id}"),
+            InlineKeyboardButton("Cancelar", callback_data="deltask:cancel"),
+        ]
+    ]
+    keyboard = InlineKeyboardMarkup(buttons)
+    await query.edit_message_text("Tem certeza que deseja excluir esta tarefa?", reply_markup=keyboard)
+
+
 async def callback_delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    task_id = query.data.replace("deltask:", "", 1)
+
+    if task_id == "cancel":
+        await query.edit_message_text("Exclusão cancelada.")
+        return
 
     telegram_id = query.from_user.id
     user_id = get_user_id(telegram_id)
     if not user_id:
         await query.edit_message_text("Erro: usuário não encontrado.")
         return
-
-    task_id = query.data.replace("deltask:", "", 1)
 
     try:
         delete_task(user_id, task_id)
@@ -751,10 +986,13 @@ def create_bot(token: str) -> Application:
     )
 
     app.add_handler(auth_handler)
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ajuda", cmd_ajuda))
-    app.add_handler(CommandHandler("start", cmd_ajuda))
+    app.add_handler(CommandHandler("hoje", cmd_hoje))
+    app.add_handler(CommandHandler("amanha", cmd_amanha))
     app.add_handler(CommandHandler("eventos", cmd_eventos))
     app.add_handler(CommandHandler("criar", cmd_criar))
+    app.add_handler(CommandHandler("editar", cmd_editar))
     app.add_handler(CommandHandler("excluir", cmd_excluir))
     app.add_handler(CommandHandler("livre", cmd_livre))
     app.add_handler(CommandHandler("semana", cmd_semana))
@@ -767,8 +1005,14 @@ def create_bot(token: str) -> Application:
     app.add_handler(CommandHandler("silencio", cmd_silencio))
     app.add_handler(CommandHandler("ativar", cmd_ativar))
     app.add_handler(CallbackQueryHandler(callback_select_calendar, pattern=r"^cal:"))
+    app.add_handler(CallbackQueryHandler(callback_confirm_delete_event, pattern=r"^confirmdel:"))
     app.add_handler(CallbackQueryHandler(callback_delete_event, pattern=r"^del:"))
+    app.add_handler(CallbackQueryHandler(callback_select_edit, pattern=r"^edit:"))
+    app.add_handler(CallbackQueryHandler(callback_select_edit_field, pattern=r"^editfield:"))
     app.add_handler(CallbackQueryHandler(callback_complete_task, pattern=r"^done:"))
+    app.add_handler(CallbackQueryHandler(callback_confirm_delete_task, pattern=r"^confirmdeltask:"))
     app.add_handler(CallbackQueryHandler(callback_delete_task, pattern=r"^deltask:"))
+    # Handler para capturar resposta de edição (texto livre após selecionar campo)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_response))
 
     return app

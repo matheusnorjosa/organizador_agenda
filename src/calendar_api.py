@@ -35,6 +35,13 @@ DAYS_PT = {
     6: "Domingo",
 }
 
+RECURRENCE_MAP = {
+    "diario": "RRULE:FREQ=DAILY",
+    "semanal": "RRULE:FREQ=WEEKLY",
+    "quinzenal": "RRULE:FREQ=WEEKLY;INTERVAL=2",
+    "mensal": "RRULE:FREQ=MONTHLY",
+}
+
 
 def get_timezone() -> ZoneInfo:
     return ZoneInfo(os.getenv("TIMEZONE", "America/Sao_Paulo"))
@@ -109,7 +116,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"Erro na autenticacao.")
 
     def log_message(self, format, *args):
-        pass  # silencia logs do servidor
+        pass
 
 
 def wait_for_callback(flow: Flow, user_id: str, timeout: int = 30) -> bool:
@@ -237,7 +244,7 @@ def get_events_between(user_id: str, start_date: date, end_date: date) -> list[d
     return result.get("items", [])
 
 
-# --- Criar e excluir eventos ---
+# --- Criar, editar e excluir eventos ---
 
 def list_calendars(user_id: str) -> list[dict]:
     service = get_calendar_service(user_id)
@@ -253,6 +260,7 @@ def list_calendars(user_id: str) -> list[dict]:
 def create_event(
     user_id: str, title: str, date: str, time: str,
     calendar_id: str = "primary", duration_minutes: int = 60,
+    recurrence: str = None,
 ) -> dict:
     service = get_calendar_service(user_id)
 
@@ -273,8 +281,56 @@ def create_event(
         },
     }
 
+    if recurrence and recurrence in RECURRENCE_MAP:
+        event["recurrence"] = [RECURRENCE_MAP[recurrence]]
+
     created = service.events().insert(calendarId=calendar_id, body=event).execute()
     return created
+
+
+def update_event(user_id: str, event_id: str, updates: dict) -> dict:
+    service = get_calendar_service(user_id)
+    event = service.events().get(calendarId="primary", eventId=event_id).execute()
+
+    timezone = os.getenv("TIMEZONE", "America/Sao_Paulo")
+
+    if "title" in updates:
+        event["summary"] = updates["title"]
+
+    if "date" in updates and "time" in updates:
+        start_dt = datetime.strptime(f"{updates['date']} {updates['time']}", "%d/%m/%Y %H:%M")
+        old_start = datetime.fromisoformat(event["start"]["dateTime"])
+        old_end = datetime.fromisoformat(event["end"]["dateTime"])
+        duration = old_end - old_start
+        end_dt = start_dt + duration
+
+        event["start"] = {"dateTime": start_dt.isoformat(), "timeZone": timezone}
+        event["end"] = {"dateTime": end_dt.isoformat(), "timeZone": timezone}
+
+    elif "date" in updates:
+        old_start = datetime.fromisoformat(event["start"]["dateTime"])
+        old_end = datetime.fromisoformat(event["end"]["dateTime"])
+        duration = old_end - old_start
+        new_date = datetime.strptime(updates["date"], "%d/%m/%Y").date()
+        start_dt = datetime.combine(new_date, old_start.time())
+        end_dt = start_dt + duration
+
+        event["start"] = {"dateTime": start_dt.isoformat(), "timeZone": timezone}
+        event["end"] = {"dateTime": end_dt.isoformat(), "timeZone": timezone}
+
+    elif "time" in updates:
+        old_start = datetime.fromisoformat(event["start"]["dateTime"])
+        old_end = datetime.fromisoformat(event["end"]["dateTime"])
+        duration = old_end - old_start
+        new_time = datetime.strptime(updates["time"], "%H:%M").time()
+        start_dt = datetime.combine(old_start.date(), new_time)
+        end_dt = start_dt + duration
+
+        event["start"] = {"dateTime": start_dt.isoformat(), "timeZone": timezone}
+        event["end"] = {"dateTime": end_dt.isoformat(), "timeZone": timezone}
+
+    updated = service.events().update(calendarId="primary", eventId=event_id, body=event).execute()
+    return updated
 
 
 def delete_event(user_id: str, event_id: str):
@@ -366,63 +422,6 @@ def get_upcoming_birthdays(user_id: str, days_ahead: int = 7) -> list[dict]:
     return upcoming
 
 
-# --- Formatação ---
-
-def format_event(event: dict) -> str:
-    summary = event.get("summary", "Sem título")
-
-    start = event["start"]
-    if "dateTime" in start:
-        dt = datetime.fromisoformat(start["dateTime"])
-        date_str = dt.strftime("%d/%m/%Y às %H:%M")
-    else:
-        date_str = start.get("date", "Data indefinida")
-
-    return f"• {summary} — {date_str}"
-
-
-def format_event_short(event: dict) -> str:
-    summary = event.get("summary", "Sem título")
-
-    start = event["start"]
-    if "dateTime" in start:
-        dt = datetime.fromisoformat(start["dateTime"])
-        return f"  {dt.strftime('%H:%M')} — {summary}"
-    return f"  Dia todo — {summary}"
-
-
-def format_weekly_summary(user_id: str) -> str:
-    tz = get_timezone()
-    today = datetime.now(tz).date()
-
-    monday = today + timedelta(days=(7 - today.weekday()) % 7)
-    if monday == today:
-        monday = today + timedelta(days=1)
-
-    lines = ["📋 *Programação da semana*\n"]
-
-    has_events = False
-    for i in range(7):
-        day = monday + timedelta(days=i)
-        day_name = DAYS_PT[day.weekday()]
-        date_str = day.strftime("%d/%m")
-
-        events = get_events_for_date(user_id, day)
-        lines.append(f"\n*{day_name} ({date_str}):*")
-
-        if events:
-            has_events = True
-            for ev in events:
-                lines.append(format_event_short(ev))
-        else:
-            lines.append("  Sem eventos")
-
-    if not has_events:
-        return "📋 *Programação da semana*\n\nSemana livre! Nenhum evento agendado."
-
-    return "\n".join(lines)
-
-
 def get_tasks_service(user_id: str):
     token_path = get_token_path(user_id)
     creds = Credentials.from_authorized_user_file(token_path, SCOPES)
@@ -482,12 +481,146 @@ def delete_task(user_id: str, task_id: str, task_list_id: str = "@default"):
 
 def format_task(task: dict) -> str:
     title = task.get("title", "Sem título")
-    status = "✅" if task.get("status") == "completed" else "⬜"
     due = task.get("due")
+
     if due:
         dt = datetime.fromisoformat(due.replace("Z", "+00:00"))
-        return f"{status} {title} — até {dt.strftime('%d/%m/%Y')}"
+        due_date = dt.date()
+        today = date.today()
+
+        if task.get("status") == "completed":
+            return f"✅ {title} — até {dt.strftime('%d/%m/%Y')}"
+
+        if due_date < today:
+            return f"🔴 {title} — ATRASADA (prazo: {dt.strftime('%d/%m/%Y')})"
+
+        if due_date == today:
+            return f"🟡 {title} — vence HOJE"
+
+        return f"⬜ {title} — até {dt.strftime('%d/%m/%Y')}"
+
+    status = "✅" if task.get("status") == "completed" else "⬜"
     return f"{status} {title}"
+
+
+# --- Formatação ---
+
+def _calc_duration_str(start_dt: datetime, end_dt: datetime) -> str:
+    diff = end_dt - start_dt
+    total_min = int(diff.total_seconds() / 60)
+    if total_min < 60:
+        return f"{total_min}min"
+    hours = total_min // 60
+    minutes = total_min % 60
+    if minutes == 0:
+        return f"{hours}h"
+    return f"{hours}h{minutes}min"
+
+
+def _get_period(hour: int) -> str:
+    if hour < 12:
+        return "manha"
+    if hour < 18:
+        return "tarde"
+    return "noite"
+
+
+PERIOD_LABELS = {
+    "manha": "🌅 *Manhã*",
+    "tarde": "☀️ *Tarde*",
+    "noite": "🌙 *Noite*",
+}
+
+
+def format_event(event: dict) -> str:
+    summary = event.get("summary", "Sem título")
+
+    start = event["start"]
+    end = event.get("end", {})
+
+    if "dateTime" in start:
+        start_dt = datetime.fromisoformat(start["dateTime"])
+        end_dt = datetime.fromisoformat(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
+        duration = _calc_duration_str(start_dt, end_dt)
+        return f"• {summary} — {start_dt.strftime('%d/%m/%Y')} {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} ({duration})"
+
+    date_str = start.get("date", "Data indefinida")
+    return f"• {summary} — {date_str} (dia todo)"
+
+
+def format_event_short(event: dict) -> str:
+    summary = event.get("summary", "Sem título")
+
+    start = event["start"]
+    end = event.get("end", {})
+
+    if "dateTime" in start:
+        start_dt = datetime.fromisoformat(start["dateTime"])
+        end_dt = datetime.fromisoformat(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
+        duration = _calc_duration_str(start_dt, end_dt)
+        return f"  {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} — {summary} ({duration})"
+
+    return f"  Dia todo — {summary}"
+
+
+def format_events_by_period(events: list[dict]) -> str:
+    periods = {"manha": [], "tarde": [], "noite": [], "dia_todo": []}
+
+    for ev in events:
+        start = ev["start"]
+        if "dateTime" in start:
+            start_dt = datetime.fromisoformat(start["dateTime"])
+            period = _get_period(start_dt.hour)
+            periods[period].append(ev)
+        else:
+            periods["dia_todo"].append(ev)
+
+    lines = []
+
+    if periods["dia_todo"]:
+        lines.append("📌 *Dia todo*")
+        for ev in periods["dia_todo"]:
+            lines.append(format_event_short(ev))
+
+    for period_key in ["manha", "tarde", "noite"]:
+        if periods[period_key]:
+            lines.append(f"\n{PERIOD_LABELS[period_key]}")
+            for ev in periods[period_key]:
+                lines.append(format_event_short(ev))
+
+    return "\n".join(lines)
+
+
+def format_weekly_summary(user_id: str) -> str:
+    tz = get_timezone()
+    today = datetime.now(tz).date()
+
+    monday = today + timedelta(days=(7 - today.weekday()) % 7)
+    if monday == today:
+        monday = today + timedelta(days=1)
+
+    lines = ["📋 *Programação da semana*\n"]
+
+    has_events = False
+    for i in range(7):
+        day = monday + timedelta(days=i)
+        day_name = DAYS_PT[day.weekday()]
+        date_str = day.strftime("%d/%m")
+
+        events = get_events_for_date(user_id, day)
+        lines.append(f"\n*{day_name} ({date_str}):*")
+
+        if events:
+            has_events = True
+            for ev in events:
+                lines.append(format_event_short(ev))
+        else:
+            lines.append("  Sem eventos")
+
+    if not has_events:
+        return "📋 *Programação da semana*\n\nSemana livre! Nenhum evento agendado."
+
+    return "\n".join(lines)
 
 
 def format_daily_summary(user_id: str) -> str:
@@ -501,11 +634,9 @@ def format_daily_summary(user_id: str) -> str:
     lines = [f"☀️ *Bom dia! {day_name}, {date_str}*\n"]
 
     if events:
-        lines.append("📅 *Eventos:*")
-        for ev in events:
-            lines.append(format_event_short(ev))
+        lines.append(format_events_by_period(events))
     else:
-        lines.append("📅 Nenhum evento hoje.")
+        lines.append("📅 Nenhum evento hoje. Dia livre!")
 
     try:
         tasks = get_tasks(user_id)
