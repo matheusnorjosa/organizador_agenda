@@ -192,56 +192,69 @@ def is_user_authenticated(user_id: str) -> bool:
 
 # --- Buscar eventos ---
 
-def get_events(user_id: str, days_ahead: int = 1) -> list[dict]:
+def list_all_calendars(user_id: str) -> list[dict]:
+    """Lista todas as agendas do usuário (próprias, compartilhadas, inscritas)."""
     service = get_calendar_service(user_id)
+    result = service.calendarList().list().execute()
+    return [
+        {
+            "id": cal["id"],
+            "name": cal.get("summary", "Sem nome"),
+            "access": cal.get("accessRole", "reader"),
+            "primary": cal.get("primary", False),
+        }
+        for cal in result.get("items", [])
+    ]
 
+
+def _fetch_events_from_all_calendars(
+    user_id: str, time_min: str, time_max: str,
+) -> list[dict]:
+    """Busca eventos de todas as agendas do usuário."""
+    service = get_calendar_service(user_id)
+    calendars = list_all_calendars(user_id)
+
+    all_events = []
+    for cal in calendars:
+        try:
+            result = service.events().list(
+                calendarId=cal["id"],
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy="startTime",
+            ).execute()
+
+            for event in result.get("items", []):
+                if not cal["primary"]:
+                    event["_calendar_name"] = cal["name"]
+                all_events.append(event)
+        except Exception:
+            continue
+
+    all_events.sort(key=lambda ev: ev.get("start", {}).get("dateTime", ev.get("start", {}).get("date", "")))
+    return all_events
+
+
+def get_events(user_id: str, days_ahead: int = 1) -> list[dict]:
     now = datetime.utcnow()
     time_min = now.isoformat() + "Z"
     time_max = (now + timedelta(days=days_ahead)).isoformat() + "Z"
-
-    result = service.events().list(
-        calendarId="primary",
-        timeMin=time_min,
-        timeMax=time_max,
-        singleEvents=True,
-        orderBy="startTime",
-    ).execute()
-
-    return result.get("items", [])
+    return _fetch_events_from_all_calendars(user_id, time_min, time_max)
 
 
 def get_events_for_date(user_id: str, target_date: date) -> list[dict]:
     tz = get_timezone()
     start = datetime.combine(target_date, dt_time.min, tzinfo=tz)
     end = datetime.combine(target_date, dt_time.max, tzinfo=tz)
-
-    service = get_calendar_service(user_id)
-    result = service.events().list(
-        calendarId="primary",
-        timeMin=start.isoformat(),
-        timeMax=end.isoformat(),
-        singleEvents=True,
-        orderBy="startTime",
-    ).execute()
-
-    return result.get("items", [])
+    return _fetch_events_from_all_calendars(user_id, start.isoformat(), end.isoformat())
 
 
 def get_events_between(user_id: str, start_date: date, end_date: date) -> list[dict]:
     tz = get_timezone()
     start = datetime.combine(start_date, dt_time.min, tzinfo=tz)
     end = datetime.combine(end_date, dt_time.max, tzinfo=tz)
-
-    service = get_calendar_service(user_id)
-    result = service.events().list(
-        calendarId="primary",
-        timeMin=start.isoformat(),
-        timeMax=end.isoformat(),
-        singleEvents=True,
-        orderBy="startTime",
-    ).execute()
-
-    return result.get("items", [])
+    return _fetch_events_from_all_calendars(user_id, start.isoformat(), end.isoformat())
 
 
 # --- Criar, editar e excluir eventos ---
@@ -532,8 +545,16 @@ PERIOD_LABELS = {
 }
 
 
+def _calendar_tag(event: dict) -> str:
+    cal_name = event.get("_calendar_name")
+    if cal_name:
+        return f" [{cal_name}]"
+    return ""
+
+
 def format_event(event: dict) -> str:
     summary = event.get("summary", "Sem título")
+    tag = _calendar_tag(event)
 
     start = event["start"]
     end = event.get("end", {})
@@ -542,14 +563,15 @@ def format_event(event: dict) -> str:
         start_dt = datetime.fromisoformat(start["dateTime"])
         end_dt = datetime.fromisoformat(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
         duration = _calc_duration_str(start_dt, end_dt)
-        return f"• {summary} — {start_dt.strftime('%d/%m/%Y')} {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} ({duration})"
+        return f"• {summary}{tag} — {start_dt.strftime('%d/%m/%Y')} {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} ({duration})"
 
     date_str = start.get("date", "Data indefinida")
-    return f"• {summary} — {date_str} (dia todo)"
+    return f"• {summary}{tag} — {date_str} (dia todo)"
 
 
 def format_event_short(event: dict) -> str:
     summary = event.get("summary", "Sem título")
+    tag = _calendar_tag(event)
 
     start = event["start"]
     end = event.get("end", {})
@@ -558,9 +580,9 @@ def format_event_short(event: dict) -> str:
         start_dt = datetime.fromisoformat(start["dateTime"])
         end_dt = datetime.fromisoformat(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
         duration = _calc_duration_str(start_dt, end_dt)
-        return f"  {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} — {summary} ({duration})"
+        return f"  {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} — {summary}{tag} ({duration})"
 
-    return f"  Dia todo — {summary}"
+    return f"  Dia todo — {summary}{tag}"
 
 
 def format_events_by_period(events: list[dict]) -> str:
