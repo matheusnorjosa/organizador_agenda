@@ -976,9 +976,12 @@ async def cmd_agendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_str = parsed["time"]
     recurrence = parsed.get("recurrence")
 
-    confirm_text = f"📅 Entendi:\n\n*{title}*\nData: {date_str}\nHorário: {time_str}"
-    if recurrence:
-        confirm_text += f"\nRecorrência: {recurrence}"
+    try:
+        calendars = list_calendars(user_id)
+    except Exception as e:
+        logger.error(f"Erro ao listar agendas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar suas agendas.")
+        return
 
     context.user_data["pending_event"] = {
         "title": title,
@@ -987,6 +990,62 @@ async def cmd_agendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "recurrence": recurrence,
     }
 
+    confirm_text = f"📅 Entendi:\n\n*{title}*\nData: {date_str}\nHorário: {time_str}"
+    if recurrence:
+        confirm_text += f"\nRecorrência: {recurrence}"
+
+    if len(calendars) == 1:
+        context.user_data["pending_event"]["calendar_id"] = calendars[0]["id"]
+        confirm_text += f"\nAgenda: {calendars[0]['name']}"
+        buttons = [
+            [
+                InlineKeyboardButton("Confirmar", callback_data="nlconfirm:yes"),
+                InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no"),
+            ]
+        ]
+    else:
+        confirm_text += "\n\nEm qual agenda?"
+        buttons = [
+            [InlineKeyboardButton(cal["name"], callback_data=f"nlcal:{cal['id']}")]
+            for cal in calendars
+        ]
+        buttons.append([InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no")])
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(confirm_text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+async def callback_nl_select_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    calendar_id = query.data.replace("nlcal:", "", 1)
+    context.user_data.setdefault("pending_event", {})["calendar_id"] = calendar_id
+
+    # Busca nome da agenda para mostrar na confirmação
+    telegram_id = query.from_user.id
+    user_id = get_user_id(telegram_id)
+    cal_name = calendar_id
+    if user_id:
+        try:
+            calendars = list_calendars(user_id)
+            for cal in calendars:
+                if cal["id"] == calendar_id:
+                    cal_name = cal["name"]
+                    break
+        except Exception:
+            pass
+
+    pending = context.user_data.get("pending_event", {})
+    confirm_text = (
+        f"📅 Confirma?\n\n"
+        f"*{pending.get('title', '')}*\n"
+        f"Data: {pending.get('date', '')}\n"
+        f"Horário: {pending.get('time', '')}\n"
+        f"Agenda: {cal_name}"
+    )
+    if pending.get("recurrence"):
+        confirm_text += f"\nRecorrência: {pending['recurrence']}"
+
     buttons = [
         [
             InlineKeyboardButton("Confirmar", callback_data="nlconfirm:yes"),
@@ -994,7 +1053,7 @@ async def cmd_agendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ]
     keyboard = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(confirm_text, reply_markup=keyboard, parse_mode="Markdown")
+    await query.edit_message_text(confirm_text, reply_markup=keyboard, parse_mode="Markdown")
 
 
 async def callback_nl_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1019,9 +1078,12 @@ async def callback_nl_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("Erro: nenhum evento pendente.")
         return
 
+    calendar_id = pending.get("calendar_id", "primary")
+
     try:
         created = create_event(
             user_id, pending["title"], pending["date"], pending["time"],
+            calendar_id=calendar_id,
             recurrence=pending.get("recurrence"),
         )
         summary = created.get("summary", pending["title"])
@@ -1030,7 +1092,7 @@ async def callback_nl_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
             text += f" ({pending['recurrence']})"
         await query.edit_message_text(text)
     except Exception as e:
-        logger.error(f"Erro ao criar evento via IA para {user_id}: {e}")
+        logger.error(f"Erro ao criar evento para {user_id}: {e}")
         await query.edit_message_text("Erro ao criar evento. Tente novamente.")
 
     context.user_data.pop("pending_event", None)
@@ -1234,6 +1296,13 @@ async def _nl_criar_evento(update, context, user_id, result):
         )
         return
 
+    try:
+        calendars = list_calendars(user_id)
+    except Exception as e:
+        logger.error(f"Erro ao listar agendas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar suas agendas.")
+        return
+
     context.user_data["pending_event"] = {
         "title": title,
         "date": date_str,
@@ -1245,12 +1314,23 @@ async def _nl_criar_evento(update, context, user_id, result):
     if recurrence:
         confirm_text += f"\nRecorrência: {recurrence}"
 
-    buttons = [
-        [
-            InlineKeyboardButton("Confirmar", callback_data="nlconfirm:yes"),
-            InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no"),
+    if len(calendars) == 1:
+        context.user_data["pending_event"]["calendar_id"] = calendars[0]["id"]
+        confirm_text += f"\nAgenda: {calendars[0]['name']}"
+        buttons = [
+            [
+                InlineKeyboardButton("Confirmar", callback_data="nlconfirm:yes"),
+                InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no"),
+            ]
         ]
-    ]
+    else:
+        confirm_text += "\n\nEm qual agenda?"
+        buttons = [
+            [InlineKeyboardButton(cal["name"], callback_data=f"nlcal:{cal['id']}")]
+            for cal in calendars
+        ]
+        buttons.append([InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no")])
+
     keyboard = InlineKeyboardMarkup(buttons)
     await update.message.reply_text(confirm_text, reply_markup=keyboard, parse_mode="Markdown")
 
@@ -1474,6 +1554,7 @@ def create_bot(token: str) -> Application:
     app.add_handler(CallbackQueryHandler(callback_delete_event, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(callback_select_edit, pattern=r"^edit:"))
     app.add_handler(CallbackQueryHandler(callback_select_edit_field, pattern=r"^editfield:"))
+    app.add_handler(CallbackQueryHandler(callback_nl_select_calendar, pattern=r"^nlcal:"))
     app.add_handler(CallbackQueryHandler(callback_nl_confirm, pattern=r"^nlconfirm:"))
     app.add_handler(CallbackQueryHandler(callback_complete_task, pattern=r"^done:"))
     app.add_handler(CallbackQueryHandler(callback_confirm_delete_task, pattern=r"^confirmdeltask:"))
