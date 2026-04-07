@@ -1,0 +1,30 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy na VM Oracle
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ubuntu
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            cd ~/organizador_agenda
+            git pull
+            docker stop organizador-agenda && docker rm organizador-agenda || true
+            docker build -t organizador-agenda .
+            docker run -d \
+              --name organizador-agenda \
+              --restart unless-stopped \
+              --env-file .env \
+              -v $(pwd)/credentials.json:/app/credentials.json \
+              -v $(pwd)/tokens:/app/tokens \
+              -v $(pwd)/users.json:/app/users.json \
+              organizador-agenda
