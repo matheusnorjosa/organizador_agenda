@@ -41,7 +41,7 @@ from src.calendar_api import (
     DAYS_PT,
     RECURRENCE_MAP,
 )
-from src.natural_language import parse_event_from_text
+from src.natural_language import parse_event_from_text, parse_intent
 
 logger = logging.getLogger(__name__)
 
@@ -542,7 +542,7 @@ async def handle_edit_response(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = get_user_id(telegram_id)
 
     if not event_id or not field or not user_id:
-        return
+        return False
 
     value = update.message.text.strip()
     updates = {field: value}
@@ -557,6 +557,7 @@ async def handle_edit_response(update: Update, context: ContextTypes.DEFAULT_TYP
 
     context.user_data.pop("editing_event_id", None)
     context.user_data.pop("editing_field", None)
+    return True
 
 
 # --- /excluir (com confirmação) ---
@@ -975,9 +976,12 @@ async def cmd_agendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_str = parsed["time"]
     recurrence = parsed.get("recurrence")
 
-    confirm_text = f"📅 Entendi:\n\n*{title}*\nData: {date_str}\nHorário: {time_str}"
-    if recurrence:
-        confirm_text += f"\nRecorrência: {recurrence}"
+    try:
+        calendars = list_calendars(user_id)
+    except Exception as e:
+        logger.error(f"Erro ao listar agendas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar suas agendas.")
+        return
 
     context.user_data["pending_event"] = {
         "title": title,
@@ -986,6 +990,62 @@ async def cmd_agendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "recurrence": recurrence,
     }
 
+    confirm_text = f"📅 Entendi:\n\n*{title}*\nData: {date_str}\nHorário: {time_str}"
+    if recurrence:
+        confirm_text += f"\nRecorrência: {recurrence}"
+
+    if len(calendars) == 1:
+        context.user_data["pending_event"]["calendar_id"] = calendars[0]["id"]
+        confirm_text += f"\nAgenda: {calendars[0]['name']}"
+        buttons = [
+            [
+                InlineKeyboardButton("Confirmar", callback_data="nlconfirm:yes"),
+                InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no"),
+            ]
+        ]
+    else:
+        confirm_text += "\n\nEm qual agenda?"
+        buttons = [
+            [InlineKeyboardButton(cal["name"], callback_data=f"nlcal:{cal['id']}")]
+            for cal in calendars
+        ]
+        buttons.append([InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no")])
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(confirm_text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+async def callback_nl_select_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    calendar_id = query.data.replace("nlcal:", "", 1)
+    context.user_data.setdefault("pending_event", {})["calendar_id"] = calendar_id
+
+    # Busca nome da agenda para mostrar na confirmação
+    telegram_id = query.from_user.id
+    user_id = get_user_id(telegram_id)
+    cal_name = calendar_id
+    if user_id:
+        try:
+            calendars = list_calendars(user_id)
+            for cal in calendars:
+                if cal["id"] == calendar_id:
+                    cal_name = cal["name"]
+                    break
+        except Exception:
+            pass
+
+    pending = context.user_data.get("pending_event", {})
+    confirm_text = (
+        f"📅 Confirma?\n\n"
+        f"*{pending.get('title', '')}*\n"
+        f"Data: {pending.get('date', '')}\n"
+        f"Horário: {pending.get('time', '')}\n"
+        f"Agenda: {cal_name}"
+    )
+    if pending.get("recurrence"):
+        confirm_text += f"\nRecorrência: {pending['recurrence']}"
+
     buttons = [
         [
             InlineKeyboardButton("Confirmar", callback_data="nlconfirm:yes"),
@@ -993,7 +1053,7 @@ async def cmd_agendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ]
     keyboard = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(confirm_text, reply_markup=keyboard, parse_mode="Markdown")
+    await query.edit_message_text(confirm_text, reply_markup=keyboard, parse_mode="Markdown")
 
 
 async def callback_nl_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1018,9 +1078,12 @@ async def callback_nl_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("Erro: nenhum evento pendente.")
         return
 
+    calendar_id = pending.get("calendar_id", "primary")
+
     try:
         created = create_event(
             user_id, pending["title"], pending["date"], pending["time"],
+            calendar_id=calendar_id,
             recurrence=pending.get("recurrence"),
         )
         summary = created.get("summary", pending["title"])
@@ -1029,7 +1092,7 @@ async def callback_nl_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
             text += f" ({pending['recurrence']})"
         await query.edit_message_text(text)
     except Exception as e:
-        logger.error(f"Erro ao criar evento via IA para {user_id}: {e}")
+        logger.error(f"Erro ao criar evento para {user_id}: {e}")
         await query.edit_message_text("Erro ao criar evento. Tente novamente.")
 
     context.user_data.pop("pending_event", None)
@@ -1156,6 +1219,296 @@ async def cmd_ativar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔔 Lembretes reativados!")
 
 
+# --- Handler de texto livre (linguagem natural) ---
+
+async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Se está aguardando resposta de edição, processa isso primeiro
+    if context.user_data.get("editing_event_id") and context.user_data.get("editing_field"):
+        handled = await handle_edit_response(update, context)
+        if handled:
+            return
+
+    telegram_id = update.effective_user.id
+    user_id = get_user_id(telegram_id)
+    if not user_id or not is_user_authenticated(user_id):
+        return
+
+    user_message = update.message.text.strip()
+    if len(user_message) < 3:
+        return
+
+    await update.message.reply_text("🤖 Entendendo...")
+
+    result = await parse_intent(user_message)
+
+    if not result or result.get("intent") == "desconhecido":
+        await update.message.reply_text(
+            "Não entendi. Tente reformular ou use /ajuda para ver os comandos."
+        )
+        return
+
+    intent = result["intent"]
+
+    if intent == "criar_evento":
+        await _nl_criar_evento(update, context, user_id, result)
+
+    elif intent == "editar_evento":
+        await _nl_editar_evento(update, context, user_id, result)
+
+    elif intent == "excluir_evento":
+        await _nl_excluir_evento(update, context, user_id, result)
+
+    elif intent == "listar_eventos_hoje":
+        await cmd_hoje(update, context)
+
+    elif intent == "listar_eventos_amanha":
+        await cmd_amanha(update, context)
+
+    elif intent == "listar_eventos_semana":
+        await cmd_eventos(update, context)
+
+    elif intent == "horarios_livres":
+        await cmd_livre(update, context)
+
+    elif intent == "criar_tarefa":
+        await _nl_criar_tarefa(update, context, user_id, result)
+
+    elif intent == "listar_tarefas":
+        await cmd_tarefas(update, context)
+
+    elif intent == "concluir_tarefa":
+        await _nl_concluir_tarefa(update, context, user_id, result)
+
+    elif intent == "excluir_tarefa":
+        await _nl_excluir_tarefa(update, context, user_id, result)
+
+
+async def _nl_criar_evento(update, context, user_id, result):
+    title = result.get("title")
+    date_str = result.get("date")
+    time_str = result.get("time")
+    recurrence = result.get("recurrence")
+
+    if not title or not date_str or not time_str:
+        await update.message.reply_text(
+            "Não consegui extrair todas as informações. Tente:\n"
+            "/criar <título> <dd/mm/aaaa> <hh:mm>"
+        )
+        return
+
+    try:
+        calendars = list_calendars(user_id)
+    except Exception as e:
+        logger.error(f"Erro ao listar agendas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar suas agendas.")
+        return
+
+    context.user_data["pending_event"] = {
+        "title": title,
+        "date": date_str,
+        "time": time_str,
+        "recurrence": recurrence,
+    }
+
+    confirm_text = f"📅 Entendi:\n\n*{title}*\nData: {date_str}\nHorário: {time_str}"
+    if recurrence:
+        confirm_text += f"\nRecorrência: {recurrence}"
+
+    if len(calendars) == 1:
+        context.user_data["pending_event"]["calendar_id"] = calendars[0]["id"]
+        confirm_text += f"\nAgenda: {calendars[0]['name']}"
+        buttons = [
+            [
+                InlineKeyboardButton("Confirmar", callback_data="nlconfirm:yes"),
+                InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no"),
+            ]
+        ]
+    else:
+        confirm_text += "\n\nEm qual agenda?"
+        buttons = [
+            [InlineKeyboardButton(cal["name"], callback_data=f"nlcal:{cal['id']}")]
+            for cal in calendars
+        ]
+        buttons.append([InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no")])
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(confirm_text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+async def _nl_editar_evento(update, context, user_id, result):
+    search_term = result.get("search_term", "")
+
+    try:
+        events = get_events(user_id, days_ahead=30)
+    except Exception as e:
+        logger.error(f"Erro ao buscar eventos de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar a agenda.")
+        return
+
+    if search_term:
+        filtered = [
+            ev for ev in events
+            if search_term.lower() in ev.get("summary", "").lower()
+        ]
+        if filtered:
+            events = filtered
+
+    if not events:
+        await update.message.reply_text("Nenhum evento encontrado para editar.")
+        return
+
+    buttons = []
+    for ev in events[:10]:
+        summary = ev.get("summary", "Sem título")
+        start = ev["start"]
+        if "dateTime" in start:
+            dt = datetime.fromisoformat(start["dateTime"])
+            label = f"{summary} — {dt.strftime('%d/%m %H:%M')}"
+        else:
+            label = f"{summary} — {start.get('date', '')}"
+        buttons.append(
+            [InlineKeyboardButton(label, callback_data=f"edit:{ev['id']}")]
+        )
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        "✏️ Qual evento deseja editar?",
+        reply_markup=keyboard,
+    )
+
+
+async def _nl_excluir_evento(update, context, user_id, result):
+    search_term = result.get("search_term", "")
+
+    try:
+        events = get_events(user_id, days_ahead=30)
+    except Exception as e:
+        logger.error(f"Erro ao buscar eventos de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar a agenda.")
+        return
+
+    if search_term:
+        filtered = [
+            ev for ev in events
+            if search_term.lower() in ev.get("summary", "").lower()
+        ]
+        if filtered:
+            events = filtered
+
+    if not events:
+        await update.message.reply_text("Nenhum evento encontrado para excluir.")
+        return
+
+    buttons = []
+    for ev in events[:10]:
+        summary = ev.get("summary", "Sem título")
+        start = ev["start"]
+        if "dateTime" in start:
+            dt = datetime.fromisoformat(start["dateTime"])
+            label = f"{summary} — {dt.strftime('%d/%m %H:%M')}"
+        else:
+            label = f"{summary} — {start.get('date', '')}"
+        buttons.append(
+            [InlineKeyboardButton(label, callback_data=f"confirmdel:{ev['id']}")]
+        )
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        "🗑️ Qual evento deseja excluir?",
+        reply_markup=keyboard,
+    )
+
+
+async def _nl_criar_tarefa(update, context, user_id, result):
+    title = result.get("title")
+    date_str = result.get("date")
+
+    if not title:
+        await update.message.reply_text(
+            "Não consegui extrair o título da tarefa. Tente:\n"
+            "/nova_tarefa <título>"
+        )
+        return
+
+    try:
+        created = create_task(user_id, title, date_str)
+        text = f"✅ Tarefa criada: {created.get('title', title)}"
+        if date_str:
+            text += f" (prazo: {date_str})"
+        await update.message.reply_text(text)
+    except Exception as e:
+        logger.error(f"Erro ao criar tarefa para {user_id}: {e}")
+        await update.message.reply_text("Erro ao criar tarefa. Tente novamente.")
+
+
+async def _nl_concluir_tarefa(update, context, user_id, result):
+    search_term = result.get("search_term", "")
+
+    try:
+        tasks = get_tasks(user_id)
+        pending = [t for t in tasks if t.get("status") != "completed"]
+    except Exception as e:
+        logger.error(f"Erro ao buscar tarefas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar as tarefas.")
+        return
+
+    if search_term:
+        filtered = [
+            t for t in pending
+            if search_term.lower() in t.get("title", "").lower()
+        ]
+        if filtered:
+            pending = filtered
+
+    if not pending:
+        await update.message.reply_text("Nenhuma tarefa encontrada para concluir.")
+        return
+
+    buttons = [
+        [InlineKeyboardButton(t.get("title", "Sem título"), callback_data=f"done:{t['id']}")]
+        for t in pending[:10]
+    ]
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        "✅ Qual tarefa deseja concluir?",
+        reply_markup=keyboard,
+    )
+
+
+async def _nl_excluir_tarefa(update, context, user_id, result):
+    search_term = result.get("search_term", "")
+
+    try:
+        tasks = get_tasks(user_id)
+        pending = [t for t in tasks if t.get("status") != "completed"]
+    except Exception as e:
+        logger.error(f"Erro ao buscar tarefas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar as tarefas.")
+        return
+
+    if search_term:
+        filtered = [
+            t for t in pending
+            if search_term.lower() in t.get("title", "").lower()
+        ]
+        if filtered:
+            pending = filtered
+
+    if not pending:
+        await update.message.reply_text("Nenhuma tarefa encontrada para excluir.")
+        return
+
+    buttons = [
+        [InlineKeyboardButton(t.get("title", "Sem título"), callback_data=f"confirmdeltask:{t['id']}")]
+        for t in pending[:10]
+    ]
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        "🗑️ Qual tarefa deseja excluir?",
+        reply_markup=keyboard,
+    )
+
+
 # --- Bot setup ---
 
 def create_bot(token: str) -> Application:
@@ -1201,11 +1554,12 @@ def create_bot(token: str) -> Application:
     app.add_handler(CallbackQueryHandler(callback_delete_event, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(callback_select_edit, pattern=r"^edit:"))
     app.add_handler(CallbackQueryHandler(callback_select_edit_field, pattern=r"^editfield:"))
+    app.add_handler(CallbackQueryHandler(callback_nl_select_calendar, pattern=r"^nlcal:"))
     app.add_handler(CallbackQueryHandler(callback_nl_confirm, pattern=r"^nlconfirm:"))
     app.add_handler(CallbackQueryHandler(callback_complete_task, pattern=r"^done:"))
     app.add_handler(CallbackQueryHandler(callback_confirm_delete_task, pattern=r"^confirmdeltask:"))
     app.add_handler(CallbackQueryHandler(callback_delete_task, pattern=r"^deltask:"))
-    # Handler para capturar resposta de edição (texto livre após selecionar campo)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_response))
+    # Handler de texto livre: edição + linguagem natural
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))
 
     return app
