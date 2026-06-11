@@ -3,6 +3,9 @@ name: Deploy
 on:
   push:
     branches: [main]
+  # Merges via auto-merge usam o GITHUB_TOKEN e não disparam este workflow.
+  # O disparo manual cobre esses casos: gh workflow run deploy.yml
+  workflow_dispatch:
 
 jobs:
   deploy:
