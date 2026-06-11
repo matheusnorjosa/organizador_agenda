@@ -5,7 +5,7 @@ Bot do Telegram que integra Google Calendar, Google Tasks e Google Contacts para
 ## Funcionalidades
 
 ### Agenda
-- Lembretes automáticos (1 dia antes, no dia e 30 min antes)
+- Lembretes automáticos (1 dia antes e no dia)
 - Resumo diário às 7h com eventos separados por período (manhã, tarde, noite)
 - Resumo semanal todo domingo com programação dia a dia
 - Criar, editar e excluir eventos pelo Telegram
