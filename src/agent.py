@@ -9,7 +9,6 @@ from src.calendar_api import (
     get_events,
     get_events_for_date,
     format_event,
-    format_event_short,
     format_weekly_summary,
     format_daily_summary,
     is_user_authenticated,
@@ -34,7 +33,6 @@ WEEKLY_SUMMARY_DAY = 6
 
 # Controle para não enviar notificações duplicadas
 sent_notifications: set[str] = set()
-sent_event_reminders: set[str] = set()
 
 # Estatísticas do bot
 bot_stats = {
@@ -53,16 +51,16 @@ def notification_key(notification_type: str, user_id: str, hour: int) -> str:
     return f"{notification_type}:{user_id}:{today}:{hour}"
 
 
-def event_reminder_key(user_id: str, event_id: str) -> str:
-    return f"event:{user_id}:{event_id}"
+def _key_date(key: str) -> str:
+    parts = key.split(":")
+    return parts[2] if len(parts) > 2 else ""
 
 
 def cleanup_old_keys():
+    # Remove chaves de dias anteriores (datas ISO comparam como string).
     today = date.today().isoformat()
-    old_keys = {k for k in sent_notifications if today not in k}
+    old_keys = {k for k in sent_notifications if _key_date(k) < today}
     sent_notifications.difference_update(old_keys)
-    old_event_keys = {k for k in sent_event_reminders if today not in k}
-    sent_event_reminders.difference_update(old_event_keys)
 
 
 async def send_message(bot, chat_id: str, text: str):
@@ -120,47 +118,6 @@ async def check_reminders(app):
             logger.error(f"Erro ao verificar eventos de {user_id}: {e}")
             bot_stats["errors_count"] += 1
             await send_error_alert(app.bot, f"Erro lembretes ({user_id}): {e}")
-
-
-async def check_upcoming_events(app):
-    users = load_users()
-    bot = app.bot
-    tz = get_timezone()
-    now = datetime.now(tz)
-
-    for telegram_id, user_data in users.items():
-        user_id = user_data.get("name")
-        if not user_id or not is_user_authenticated(user_id):
-            continue
-        if is_user_silenced(int(telegram_id)):
-            continue
-
-        try:
-            events = get_events(user_id, days_ahead=1)
-
-            for ev in events:
-                start = ev.get("start", {})
-                if "dateTime" not in start:
-                    continue
-
-                event_id = ev.get("id", "")
-                key = event_reminder_key(user_id, event_id)
-                if key in sent_event_reminders:
-                    continue
-
-                event_start = datetime.fromisoformat(start["dateTime"]).astimezone(tz)
-                diff = (event_start - now).total_seconds() / 60
-
-                if 0 <= diff <= 30:
-                    summary = ev.get("summary", "Sem título")
-                    time_str = event_start.strftime("%H:%M")
-                    text = f"⏰ *Lembrete:* {summary} começa às {time_str} (em ~{int(diff)} min)"
-                    await send_message(bot, telegram_id, text)
-                    sent_event_reminders.add(key)
-
-        except Exception as e:
-            logger.error(f"Erro ao verificar próximos eventos de {user_id}: {e}")
-            bot_stats["errors_count"] += 1
 
 
 async def check_daily_summary(app):
@@ -317,7 +274,6 @@ async def notification_loop(app):
     while True:
         try:
             cleanup_old_keys()
-            await check_upcoming_events(app)
             await check_reminders(app)
             await check_daily_summary(app)
             await check_weekly_summary(app)
