@@ -217,12 +217,15 @@ def _fetch_events_from_all_calendars(
     all_events = []
     for cal in calendars:
         try:
+            # Agendas compartilhadas podem usar outro fuso (ex: UTC);
+            # pede a resposta já convertida para o fuso configurado.
             result = service.events().list(
                 calendarId=cal["id"],
                 timeMin=time_min,
                 timeMax=time_max,
                 singleEvents=True,
                 orderBy="startTime",
+                timeZone=str(get_timezone()),
             ).execute()
 
             for event in result.get("items", []):
@@ -518,6 +521,15 @@ def format_task(task: dict) -> str:
 
 # --- Formatação ---
 
+def _parse_event_datetime(value: str) -> datetime:
+    # Converte para o fuso configurado: eventos de agendas compartilhadas
+    # podem chegar em outro fuso (ex: UTC) e exibiriam o horário errado.
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(get_timezone())
+
+
 def _calc_duration_str(start_dt: datetime, end_dt: datetime) -> str:
     diff = end_dt - start_dt
     total_min = int(diff.total_seconds() / 60)
@@ -560,8 +572,8 @@ def format_event(event: dict) -> str:
     end = event.get("end", {})
 
     if "dateTime" in start:
-        start_dt = datetime.fromisoformat(start["dateTime"])
-        end_dt = datetime.fromisoformat(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
+        start_dt = _parse_event_datetime(start["dateTime"])
+        end_dt = _parse_event_datetime(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
         duration = _calc_duration_str(start_dt, end_dt)
         return f"• {summary}{tag} — {start_dt.strftime('%d/%m/%Y')} {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} ({duration})"
 
@@ -577,8 +589,8 @@ def format_event_short(event: dict) -> str:
     end = event.get("end", {})
 
     if "dateTime" in start:
-        start_dt = datetime.fromisoformat(start["dateTime"])
-        end_dt = datetime.fromisoformat(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
+        start_dt = _parse_event_datetime(start["dateTime"])
+        end_dt = _parse_event_datetime(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
         duration = _calc_duration_str(start_dt, end_dt)
         return f"  {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} — {summary}{tag} ({duration})"
 
@@ -591,7 +603,7 @@ def format_events_by_period(events: list[dict]) -> str:
     for ev in events:
         start = ev["start"]
         if "dateTime" in start:
-            start_dt = datetime.fromisoformat(start["dateTime"])
+            start_dt = _parse_event_datetime(start["dateTime"])
             period = _get_period(start_dt.hour)
             periods[period].append(ev)
         else:

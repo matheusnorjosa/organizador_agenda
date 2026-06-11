@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 
@@ -7,6 +8,7 @@ from src.calendar_api import (
     format_task,
     format_events_by_period,
     _calc_duration_str,
+    _fetch_events_from_all_calendars,
     _get_period,
     _calendar_tag,
     RECURRENCE_MAP,
@@ -182,6 +184,73 @@ class TestFormatEventsByPeriod:
         result = format_events_by_period(events)
         assert "Dia todo" in result
         assert "Feriado" in result
+
+
+class TestTimezoneConversion:
+    # Regressão: eventos de agendas compartilhadas chegavam em UTC e o
+    # horário era exibido sem conversão (17:00 em vez de 14:00).
+
+    def test_format_event_converts_utc_to_configured_timezone(self):
+        event = {
+            "summary": "US abdominal",
+            "start": {"dateTime": "2026-06-12T17:00:00Z"},
+            "end": {"dateTime": "2026-06-12T18:00:00Z"},
+        }
+        with patch.dict(os.environ, {"TIMEZONE": "America/Sao_Paulo"}):
+            result = format_event(event)
+        assert "14:00" in result
+        assert "15:00" in result
+        assert "12/06/2026" in result
+
+    def test_format_event_short_converts_utc_to_configured_timezone(self):
+        event = {
+            "summary": "US abdominal",
+            "start": {"dateTime": "2026-06-12T17:00:00Z"},
+            "end": {"dateTime": "2026-06-12T18:00:00Z"},
+        }
+        with patch.dict(os.environ, {"TIMEZONE": "America/Sao_Paulo"}):
+            result = format_event_short(event)
+        assert "14:00" in result
+        assert "15:00" in result
+
+    def test_format_events_by_period_classifies_by_local_hour(self):
+        event = {
+            "summary": "Consulta",
+            "start": {"dateTime": "2026-06-12T14:00:00Z"},
+            "end": {"dateTime": "2026-06-12T15:00:00Z"},
+        }
+        with patch.dict(os.environ, {"TIMEZONE": "America/Sao_Paulo"}):
+            result = format_events_by_period([event])
+        assert "Manhã" in result
+        assert "Tarde" not in result
+
+    def test_format_event_keeps_time_already_in_configured_timezone(self):
+        event = {
+            "summary": "Reunião",
+            "start": {"dateTime": "2026-06-12T14:00:00-03:00"},
+            "end": {"dateTime": "2026-06-12T15:00:00-03:00"},
+        }
+        with patch.dict(os.environ, {"TIMEZONE": "America/Sao_Paulo"}):
+            result = format_event(event)
+        assert "14:00" in result
+        assert "15:00" in result
+
+
+class TestFetchEventsTimezone:
+    def test_requests_events_in_configured_timezone(self):
+        calendars = [{"id": "primary", "name": "Pessoal", "access": "owner", "primary": True}]
+        mock_service = MagicMock()
+        mock_service.events.return_value.list.return_value.execute.return_value = {"items": []}
+
+        with patch.dict(os.environ, {"TIMEZONE": "America/Sao_Paulo"}), \
+             patch("src.calendar_api.get_calendar_service", return_value=mock_service), \
+             patch("src.calendar_api.list_all_calendars", return_value=calendars):
+            _fetch_events_from_all_calendars(
+                "matheus", "2026-06-12T00:00:00Z", "2026-06-13T00:00:00Z"
+            )
+
+        _, kwargs = mock_service.events.return_value.list.call_args
+        assert kwargs["timeZone"] == "America/Sao_Paulo"
 
 
 class TestRecurrenceMap:
