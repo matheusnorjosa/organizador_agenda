@@ -22,5 +22,5 @@ jobs:
 
       - name: Rodar testes
         env:
-          TIMEZONE: America/Sao_Paulo
+          TIMEZONE: America/Fortaleza
         run: pytest tests/ -v

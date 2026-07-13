@@ -1,12 +1,14 @@
 import os
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
+from zoneinfo import ZoneInfo
 
 from src.calendar_api import (
     format_event,
     format_event_short,
     format_task,
     format_events_by_period,
+    now_local,
     _calc_duration_str,
     _fetch_events_from_all_calendars,
     _get_period,
@@ -132,14 +134,16 @@ class TestFormatTask:
         assert "✅" in result
 
     def test_overdue_task(self):
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000Z")
+        # Deriva a data de now_local() (fuso configurado), igual ao código,
+        # para não depender do relógio do sistema onde o teste roda.
+        yesterday = (now_local() - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000Z")
         task = {"title": "Tarefa atrasada", "status": "needsAction", "due": yesterday}
         result = format_task(task)
         assert "🔴" in result
         assert "ATRASADA" in result
 
     def test_due_today_task(self):
-        today = datetime.now().strftime("%Y-%m-%dT00:00:00.000Z")
+        today = now_local().strftime("%Y-%m-%dT00:00:00.000Z")
         task = {"title": "Tarefa hoje", "status": "needsAction", "due": today}
         result = format_task(task)
         assert "🟡" in result
@@ -263,3 +267,31 @@ class TestRecurrenceMap:
     def test_values_are_rrule_format(self):
         for value in RECURRENCE_MAP.values():
             assert value.startswith("RRULE:")
+
+
+class TestNowLocal:
+    def test_returns_timezone_aware_datetime(self):
+        with patch.dict(os.environ, {"TIMEZONE": "America/Fortaleza"}):
+            assert now_local().tzinfo is not None
+
+    def test_uses_configured_timezone_offset(self):
+        # Fortaleza é UTC-3 o ano todo (Brasil não tem mais horário de verão)
+        with patch.dict(os.environ, {"TIMEZONE": "America/Fortaleza"}):
+            assert now_local().utcoffset() == timedelta(hours=-3)
+
+
+class TestFormatTaskTimezone:
+    def test_due_today_not_marked_overdue_near_midnight(self):
+        # 22:00 em Fortaleza já é 01:00 UTC do dia seguinte. Uma tarefa que
+        # vence hoje (13) não pode virar ATRASADA só porque o relógio do
+        # servidor (UTC) já passou para o dia 14.
+        local_now = datetime(2026, 7, 13, 22, 0, tzinfo=ZoneInfo("America/Fortaleza"))
+        task = {
+            "title": "Pagar conta",
+            "status": "needsAction",
+            "due": "2026-07-13T00:00:00.000Z",
+        }
+        with patch("src.calendar_api.now_local", return_value=local_now):
+            result = format_task(task)
+        assert "HOJE" in result
+        assert "ATRASADA" not in result

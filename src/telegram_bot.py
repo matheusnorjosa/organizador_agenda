@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -33,6 +33,7 @@ from src.calendar_api import (
     complete_auth,
     check_scopes,
     get_timezone,
+    now_local,
     get_tasks,
     create_task,
     complete_task,
@@ -647,7 +648,7 @@ async def cmd_livre(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        today = date.today()
+        today = now_local().date()
         free = get_free_slots(user_id, today)
     except Exception as e:
         logger.error(f"Erro ao buscar horários livres de {user_id}: {e}")
@@ -1164,7 +1165,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     started = bot_stats.get("started_at")
     if started and isinstance(started, str):
         started_dt = datetime.fromisoformat(started)
-        uptime = datetime.now() - started_dt
+        uptime = now_local() - started_dt
         hours = int(uptime.total_seconds() / 3600)
         minutes = int((uptime.total_seconds() % 3600) / 60)
         uptime_str = f"{hours}h {minutes}min"

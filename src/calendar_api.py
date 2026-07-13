@@ -44,7 +44,17 @@ RECURRENCE_MAP = {
 
 
 def get_timezone() -> ZoneInfo:
-    return ZoneInfo(os.getenv("TIMEZONE", "America/Sao_Paulo"))
+    return ZoneInfo(os.getenv("TIMEZONE", "America/Fortaleza"))
+
+
+def now_local() -> datetime:
+    """Horário atual no fuso configurado.
+
+    Nunca use datetime.now() sem fuso para decidir horário ou data: em
+    containers (Docker) o relógio do sistema é UTC, então as notificações
+    sairiam deslocadas do horário real do usuário.
+    """
+    return datetime.now(get_timezone())
 
 
 def get_token_path(user_id: str) -> str:
@@ -240,9 +250,9 @@ def _fetch_events_from_all_calendars(
 
 
 def get_events(user_id: str, days_ahead: int = 1) -> list[dict]:
-    now = datetime.utcnow()
-    time_min = now.isoformat() + "Z"
-    time_max = (now + timedelta(days=days_ahead)).isoformat() + "Z"
+    now = now_local()
+    time_min = now.isoformat()
+    time_max = (now + timedelta(days=days_ahead)).isoformat()
     return _fetch_events_from_all_calendars(user_id, time_min, time_max)
 
 
@@ -283,7 +293,7 @@ def create_event(
     start_dt = datetime.strptime(f"{date} {time}", "%d/%m/%Y %H:%M")
     end_dt = start_dt + timedelta(minutes=duration_minutes)
 
-    timezone = os.getenv("TIMEZONE", "America/Sao_Paulo")
+    timezone = str(get_timezone())
 
     event = {
         "summary": title,
@@ -308,7 +318,7 @@ def update_event(user_id: str, event_id: str, updates: dict) -> dict:
     service = get_calendar_service(user_id)
     event = service.events().get(calendarId="primary", eventId=event_id).execute()
 
-    timezone = os.getenv("TIMEZONE", "America/Sao_Paulo")
+    timezone = str(get_timezone())
 
     if "title" in updates:
         event["summary"] = updates["title"]
@@ -421,7 +431,7 @@ def get_birthdays(user_id: str) -> list[dict]:
 
 def get_upcoming_birthdays(user_id: str, days_ahead: int = 7) -> list[dict]:
     all_birthdays = get_birthdays(user_id)
-    today = date.today()
+    today = now_local().date()
     upcoming = []
 
     for bday in all_birthdays:
@@ -502,7 +512,7 @@ def format_task(task: dict) -> str:
     if due:
         dt = datetime.fromisoformat(due.replace("Z", "+00:00"))
         due_date = dt.date()
-        today = date.today()
+        today = now_local().date()
 
         if task.get("status") == "completed":
             return f"✅ {title} — até {dt.strftime('%d/%m/%Y')}"
