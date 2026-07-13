@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -33,6 +33,8 @@ from src.calendar_api import (
     complete_auth,
     check_scopes,
     get_timezone,
+    now_local,
+    to_local,
     get_tasks,
     create_task,
     complete_task,
@@ -481,7 +483,7 @@ async def cmd_editar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary = ev.get("summary", "Sem título")
         start = ev["start"]
         if "dateTime" in start:
-            dt = datetime.fromisoformat(start["dateTime"])
+            dt = to_local(start["dateTime"])
             label = f"{summary} — {dt.strftime('%d/%m %H:%M')}"
         else:
             label = f"{summary} — {start.get('date', '')}"
@@ -583,7 +585,7 @@ async def cmd_excluir(update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary = ev.get("summary", "Sem título")
         start = ev["start"]
         if "dateTime" in start:
-            dt = datetime.fromisoformat(start["dateTime"])
+            dt = to_local(start["dateTime"])
             label = f"{summary} — {dt.strftime('%d/%m %H:%M')}"
         else:
             label = f"{summary} — {start.get('date', '')}"
@@ -647,7 +649,7 @@ async def cmd_livre(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        today = date.today()
+        today = now_local().date()
         free = get_free_slots(user_id, today)
     except Exception as e:
         logger.error(f"Erro ao buscar horários livres de {user_id}: {e}")
@@ -1164,7 +1166,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     started = bot_stats.get("started_at")
     if started and isinstance(started, str):
         started_dt = datetime.fromisoformat(started)
-        uptime = datetime.now() - started_dt
+        uptime = now_local() - started_dt
         hours = int(uptime.total_seconds() / 3600)
         minutes = int((uptime.total_seconds() % 3600) / 60)
         uptime_str = f"{hours}h {minutes}min"
@@ -1362,7 +1364,7 @@ async def _nl_editar_evento(update, context, user_id, result):
         summary = ev.get("summary", "Sem título")
         start = ev["start"]
         if "dateTime" in start:
-            dt = datetime.fromisoformat(start["dateTime"])
+            dt = to_local(start["dateTime"])
             label = f"{summary} — {dt.strftime('%d/%m %H:%M')}"
         else:
             label = f"{summary} — {start.get('date', '')}"
@@ -1404,7 +1406,7 @@ async def _nl_excluir_evento(update, context, user_id, result):
         summary = ev.get("summary", "Sem título")
         start = ev["start"]
         if "dateTime" in start:
-            dt = datetime.fromisoformat(start["dateTime"])
+            dt = to_local(start["dateTime"])
             label = f"{summary} — {dt.strftime('%d/%m %H:%M')}"
         else:
             label = f"{summary} — {start.get('date', '')}"

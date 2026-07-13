@@ -1,11 +1,14 @@
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
+from zoneinfo import ZoneInfo
 
 from src.calendar_api import (
     format_event,
     format_event_short,
     format_task,
     format_events_by_period,
+    now_local,
+    to_local,
     _calc_duration_str,
     _get_period,
     _calendar_tag,
@@ -194,3 +197,86 @@ class TestRecurrenceMap:
     def test_values_are_rrule_format(self):
         for value in RECURRENCE_MAP.values():
             assert value.startswith("RRULE:")
+
+
+class TestNowLocal:
+    def test_returns_timezone_aware_datetime(self):
+        with patch.dict("os.environ", {"TIMEZONE": "America/Fortaleza"}):
+            assert now_local().tzinfo is not None
+
+    def test_uses_configured_timezone_offset(self):
+        # Fortaleza é UTC-3 o ano todo (Brasil não tem mais horário de verão)
+        with patch.dict("os.environ", {"TIMEZONE": "America/Fortaleza"}):
+            assert now_local().utcoffset() == timedelta(hours=-3)
+
+
+class TestToLocal:
+    def test_converts_utc_to_local(self):
+        with patch.dict("os.environ", {"TIMEZONE": "America/Fortaleza"}):
+            result = to_local("2026-07-13T23:30:00+00:00")
+        assert result.hour == 20
+        assert result.minute == 30
+        assert result.day == 13
+
+    def test_accepts_z_suffix(self):
+        with patch.dict("os.environ", {"TIMEZONE": "America/Fortaleza"}):
+            result = to_local("2026-07-13T23:30:00Z")
+        assert result.hour == 20
+
+    def test_utc_after_midnight_stays_previous_local_day(self):
+        # 02:00 UTC do dia 14 ainda é 23:00 do dia 13 em Fortaleza
+        with patch.dict("os.environ", {"TIMEZONE": "America/Fortaleza"}):
+            result = to_local("2026-07-14T02:00:00+00:00")
+        assert result.day == 13
+        assert result.hour == 23
+
+    def test_keeps_datetime_already_in_local_offset(self):
+        with patch.dict("os.environ", {"TIMEZONE": "America/Fortaleza"}):
+            result = to_local("2026-07-13T14:00:00-03:00")
+        assert result.hour == 14
+
+
+class TestFormatEventTimezone:
+    def test_normalizes_utc_datetime_to_local_hour(self):
+        # Agenda compartilhada devolvida em UTC: 23:00Z equivale a 20:00 local
+        event = {
+            "summary": "Reunião",
+            "start": {"dateTime": "2026-07-13T23:00:00+00:00"},
+            "end": {"dateTime": "2026-07-14T00:00:00+00:00"},
+        }
+        with patch.dict("os.environ", {"TIMEZONE": "America/Fortaleza"}):
+            result = format_event(event)
+        assert "20:00" in result
+        assert "21:00" in result
+        assert "13/07/2026" in result
+        assert "23:00" not in result
+
+    def test_categorizes_period_by_local_hour(self):
+        # 14:00Z equivale a 11:00 local => Manhã, não Tarde
+        events = [{
+            "summary": "Café",
+            "start": {"dateTime": "2026-07-13T14:00:00+00:00"},
+            "end": {"dateTime": "2026-07-13T15:00:00+00:00"},
+        }]
+        with patch.dict("os.environ", {"TIMEZONE": "America/Fortaleza"}):
+            result = format_events_by_period(events)
+        assert "Manhã" in result
+        assert "Tarde" not in result
+        assert "Noite" not in result
+
+
+class TestFormatTaskTimezone:
+    def test_due_today_not_marked_overdue_near_midnight(self):
+        # 22:00 em Fortaleza já é 01:00 UTC do dia seguinte. Uma tarefa que
+        # vence hoje (13) não pode virar ATRASADA só porque o relógio do
+        # servidor (UTC) já passou para o dia 14.
+        local_now = datetime(2026, 7, 13, 22, 0, tzinfo=ZoneInfo("America/Fortaleza"))
+        task = {
+            "title": "Pagar conta",
+            "status": "needsAction",
+            "due": "2026-07-13T00:00:00.000Z",
+        }
+        with patch("src.calendar_api.now_local", return_value=local_now):
+            result = format_task(task)
+        assert "HOJE" in result
+        assert "ATRASADA" not in result

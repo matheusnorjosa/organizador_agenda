@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 
@@ -14,6 +14,7 @@ from src.calendar_api import (
     format_daily_summary,
     is_user_authenticated,
     get_timezone,
+    now_local,
     get_upcoming_birthdays,
 )
 from src.telegram_bot import create_bot, load_users, is_user_silenced
@@ -49,7 +50,7 @@ ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 def notification_key(notification_type: str, user_id: str, hour: int) -> str:
-    today = date.today().isoformat()
+    today = now_local().date().isoformat()
     return f"{notification_type}:{user_id}:{today}:{hour}"
 
 
@@ -58,7 +59,7 @@ def event_reminder_key(user_id: str, event_id: str) -> str:
 
 
 def cleanup_old_keys():
-    today = date.today().isoformat()
+    today = now_local().date().isoformat()
     old_keys = {k for k in sent_notifications if today not in k}
     sent_notifications.difference_update(old_keys)
     old_event_keys = {k for k in sent_event_reminders if today not in k}
@@ -67,7 +68,7 @@ def cleanup_old_keys():
 
 async def send_message(bot, chat_id: str, text: str):
     await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-    bot_stats["last_notification"] = datetime.now().isoformat()
+    bot_stats["last_notification"] = now_local().isoformat()
     bot_stats["notifications_sent"] += 1
 
 
@@ -82,7 +83,7 @@ async def send_error_alert(bot, error_message: str):
 
 
 async def check_reminders(app):
-    current_hour = datetime.now().hour
+    current_hour = now_local().hour
     if current_hour not in REMINDER_HOURS:
         return
 
@@ -164,7 +165,7 @@ async def check_upcoming_events(app):
 
 
 async def check_daily_summary(app):
-    current_hour = datetime.now().hour
+    current_hour = now_local().hour
     if current_hour != DAILY_SUMMARY_HOUR:
         return
 
@@ -193,7 +194,7 @@ async def check_daily_summary(app):
 
 
 async def check_weekly_summary(app):
-    now = datetime.now()
+    now = now_local()
     if now.weekday() != WEEKLY_SUMMARY_DAY or now.hour != WEEKLY_SUMMARY_HOUR:
         return
 
@@ -233,7 +234,7 @@ async def check_weekly_summary(app):
 
 async def check_couple_conflicts(app):
     """Verifica conflitos de horário entre os dois usuários."""
-    current_hour = datetime.now().hour
+    current_hour = now_local().hour
     if current_hour != DAILY_SUMMARY_HOUR:
         return
 
@@ -338,7 +339,7 @@ def main():
         logger.error("TELEGRAM_BOT_TOKEN não configurado no .env")
         return
 
-    bot_stats["started_at"] = datetime.now().isoformat()
+    bot_stats["started_at"] = now_local().isoformat()
 
     app = create_bot(token)
 

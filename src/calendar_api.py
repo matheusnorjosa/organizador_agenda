@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, timedelta, date, time as dt_time
+from datetime import datetime, timedelta, date, time as dt_time, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from zoneinfo import ZoneInfo
@@ -44,7 +44,26 @@ RECURRENCE_MAP = {
 
 
 def get_timezone() -> ZoneInfo:
-    return ZoneInfo(os.getenv("TIMEZONE", "America/Sao_Paulo"))
+    return ZoneInfo(os.getenv("TIMEZONE", "America/Fortaleza"))
+
+
+def now_local() -> datetime:
+    """Horário atual no fuso configurado.
+
+    Nunca use datetime.now() sem fuso para decidir horário ou data: em
+    containers (Docker) o relógio do sistema é UTC, então as notificações
+    sairiam deslocadas do horário real do usuário.
+    """
+    return datetime.now(get_timezone())
+
+
+def to_local(google_datetime: str) -> datetime:
+    """Converte um dateTime ISO do Google Calendar para o fuso local.
+
+    O Google pode devolver eventos em UTC ou em outro fuso (agendas
+    compartilhadas e inscritas), então normalizamos antes de exibir.
+    """
+    return datetime.fromisoformat(google_datetime).astimezone(get_timezone())
 
 
 def get_token_path(user_id: str) -> str:
@@ -237,9 +256,9 @@ def _fetch_events_from_all_calendars(
 
 
 def get_events(user_id: str, days_ahead: int = 1) -> list[dict]:
-    now = datetime.utcnow()
-    time_min = now.isoformat() + "Z"
-    time_max = (now + timedelta(days=days_ahead)).isoformat() + "Z"
+    now = datetime.now(timezone.utc)
+    time_min = now.isoformat()
+    time_max = (now + timedelta(days=days_ahead)).isoformat()
     return _fetch_events_from_all_calendars(user_id, time_min, time_max)
 
 
@@ -418,7 +437,7 @@ def get_birthdays(user_id: str) -> list[dict]:
 
 def get_upcoming_birthdays(user_id: str, days_ahead: int = 7) -> list[dict]:
     all_birthdays = get_birthdays(user_id)
-    today = date.today()
+    today = now_local().date()
     upcoming = []
 
     for bday in all_birthdays:
@@ -499,7 +518,7 @@ def format_task(task: dict) -> str:
     if due:
         dt = datetime.fromisoformat(due.replace("Z", "+00:00"))
         due_date = dt.date()
-        today = date.today()
+        today = now_local().date()
 
         if task.get("status") == "completed":
             return f"✅ {title} — até {dt.strftime('%d/%m/%Y')}"
@@ -560,8 +579,8 @@ def format_event(event: dict) -> str:
     end = event.get("end", {})
 
     if "dateTime" in start:
-        start_dt = datetime.fromisoformat(start["dateTime"])
-        end_dt = datetime.fromisoformat(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
+        start_dt = to_local(start["dateTime"])
+        end_dt = to_local(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
         duration = _calc_duration_str(start_dt, end_dt)
         return f"• {summary}{tag} — {start_dt.strftime('%d/%m/%Y')} {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} ({duration})"
 
@@ -577,8 +596,8 @@ def format_event_short(event: dict) -> str:
     end = event.get("end", {})
 
     if "dateTime" in start:
-        start_dt = datetime.fromisoformat(start["dateTime"])
-        end_dt = datetime.fromisoformat(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
+        start_dt = to_local(start["dateTime"])
+        end_dt = to_local(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
         duration = _calc_duration_str(start_dt, end_dt)
         return f"  {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} — {summary}{tag} ({duration})"
 
@@ -591,7 +610,7 @@ def format_events_by_period(events: list[dict]) -> str:
     for ev in events:
         start = ev["start"]
         if "dateTime" in start:
-            start_dt = datetime.fromisoformat(start["dateTime"])
+            start_dt = to_local(start["dateTime"])
             period = _get_period(start_dt.hour)
             periods[period].append(ev)
         else:
