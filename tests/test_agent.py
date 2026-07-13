@@ -4,11 +4,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from src.agent import (
+    check_daily_summary,
     check_reminders,
     cleanup_old_keys,
     notification_key,
     sent_notifications,
+    DAILY_SUMMARY_HOUR,
 )
+from src.calendar_api import now_local
 
 
 class TestCleanupOldKeys:
@@ -68,7 +71,7 @@ class TestCheckReminders:
         event = self._make_event("evt1", "Consulta")
         get_events_mock = MagicMock(return_value=[event])
         app = self._make_app()
-        current_hour = datetime.now().hour
+        current_hour = now_local().hour
 
         async def run_two_cycles():
             cleanup_old_keys()
@@ -91,7 +94,7 @@ class TestCheckReminders:
             return [today_event, tomorrow_event]
 
         app = self._make_app()
-        current_hour = datetime.now().hour
+        current_hour = now_local().hour
 
         with self._patch_agent(MagicMock(side_effect=fake_get_events), [current_hour]):
             asyncio.run(check_reminders(app))
@@ -102,9 +105,51 @@ class TestCheckReminders:
         event = self._make_event("evt1", "Consulta")
         get_events_mock = MagicMock(return_value=[event])
         app = self._make_app()
-        other_hour = (datetime.now().hour + 2) % 24
+        other_hour = (now_local().hour + 2) % 24
 
         with self._patch_agent(get_events_mock, [other_hour]):
             asyncio.run(check_reminders(app))
 
         assert app.bot.send_message.await_count == 0
+
+
+FORTALEZA = ZoneInfo("America/Fortaleza")
+
+
+class TestNotificationKeyUsesLocalDate:
+    def test_key_has_local_date_not_system_clock(self):
+        # 22:00 em Fortaleza ainda é dia 13, mesmo que em UTC já seja dia 14.
+        local_now = datetime(2026, 7, 13, 22, 0, tzinfo=FORTALEZA)
+        with patch("src.agent.now_local", return_value=local_now):
+            key = notification_key("daily", "matheus", 7)
+        assert "2026-07-13" in key
+
+
+class TestCheckDailySummaryTiming:
+    # Regressão do bug principal: o disparo é decidido pelo horário local,
+    # não pelo relógio do sistema (UTC dentro do container Docker).
+
+    def setup_method(self):
+        sent_notifications.clear()
+
+    def _make_app(self):
+        app = MagicMock()
+        app.bot = MagicMock()
+        app.bot.send_message = AsyncMock()
+        return app
+
+    def test_runs_at_local_summary_hour(self):
+        local_now = datetime(2026, 7, 13, DAILY_SUMMARY_HOUR, 30, tzinfo=FORTALEZA)
+        with patch("src.agent.now_local", return_value=local_now), \
+                patch("src.agent.load_users", return_value={}) as mock_load:
+            asyncio.run(check_daily_summary(self._make_app()))
+        mock_load.assert_called_once()
+
+    def test_does_not_run_when_utc_matches_but_local_does_not(self):
+        # 04:00 em Fortaleza = 07:00 UTC. No bug antigo (relógio do container
+        # em UTC) o resumo das 7h disparava aqui, de madrugada. Agora não.
+        local_now = datetime(2026, 7, 13, 4, 0, tzinfo=FORTALEZA)
+        with patch("src.agent.now_local", return_value=local_now), \
+                patch("src.agent.load_users", return_value={}) as mock_load:
+            asyncio.run(check_daily_summary(self._make_app()))
+        mock_load.assert_not_called()
