@@ -286,7 +286,7 @@ def list_calendars(user_id: str) -> list[dict]:
 def create_event(
     user_id: str, title: str, date: str, time: str,
     calendar_id: str = "primary", duration_minutes: int = 60,
-    recurrence: str = None,
+    recurrence: str | None = None,
 ) -> dict:
     service = get_calendar_service(user_id)
 
@@ -480,7 +480,7 @@ def get_tasks(user_id: str, task_list_id: str = "@default", show_completed: bool
     return result.get("items", [])
 
 
-def create_task(user_id: str, title: str, due_date: str = None, task_list_id: str = "@default") -> dict:
+def create_task(user_id: str, title: str, due_date: str | None = None, task_list_id: str = "@default") -> dict:
     service = get_tasks_service(user_id)
 
     task = {"title": title}
