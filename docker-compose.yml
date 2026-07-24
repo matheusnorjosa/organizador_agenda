@@ -9,3 +9,5 @@ services:
       - ./credentials.json:/app/credentials.json
       - ./tokens:/app/tokens
       - ./users.json:/app/users.json
+      # Estado que precisa sobreviver ao restart (marco de eventos já avisados)
+      - ./estado:/app/estado

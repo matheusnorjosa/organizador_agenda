@@ -20,6 +20,7 @@ docker run -d \
   -v $(pwd)/credentials.json:/app/credentials.json \
   -v $(pwd)/tokens:/app/tokens \
   -v $(pwd)/users.json:/app/users.json \
+  -v $(pwd)/estado:/app/estado \
   organizador-agenda
 
 echo "✅ Bot atualizado e rodando!"

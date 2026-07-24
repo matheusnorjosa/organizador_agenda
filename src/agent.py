@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timedelta
@@ -38,11 +39,20 @@ SHARED_COUPLE_CALENDARS = {"familia", "família"}
 # Janela de busca para avisar sobre compromissos recém-criados
 NEW_EVENT_LOOKAHEAD_DAYS = 30
 
+# Depois de uma parada longa não vale recuperar tudo: evita despejar dias de
+# eventos de uma vez quando o bot volta do zero.
+MAX_RECOVERY_WINDOW = timedelta(hours=24)
+
+# Estado que precisa sobreviver a reinício. Fica em volume próprio: o
+# container é recriado a cada deploy e perderia o arquivo de outra forma.
+STATE_DIR = os.path.join(os.path.dirname(__file__), "..", "estado")
+STATE_PATH = os.path.join(STATE_DIR, "notificacoes.json")
+
 # Eventos já anunciados como novos, para não repetir o aviso a cada ciclo
 announced_new_events: set[str] = set()
 
-# A partir de quando um evento conta como novo. Só é definido no primeiro
-# ciclo: assim o que já existia não vira enxurrada de avisos a cada deploy.
+# A partir de quando um evento conta como novo. Carregado do disco no primeiro
+# ciclo, para que um deploy não crie janela cega nem enxurrada de avisos.
 new_events_since: datetime | None = None
 
 # Controle para não enviar notificações duplicadas
@@ -93,6 +103,45 @@ async def send_error_alert(bot, error_message: str):
         pass
 
 
+def _load_new_events_marker() -> datetime | None:
+    """Lê do disco o instante da última verificação de eventos novos.
+
+    Devolve None quando não há estado utilizável — nesse caso o bot trata
+    como primeira execução e não anuncia o que já existia.
+    """
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as state_file:
+            saved = json.load(state_file).get("ultima_verificacao_eventos")
+    except (OSError, ValueError):
+        return None
+
+    if not saved:
+        return None
+
+    try:
+        marker = datetime.fromisoformat(saved)
+    except ValueError:
+        logger.warning(f"Marco de eventos novos inválido no estado: {saved!r}")
+        return None
+
+    if marker.tzinfo is None:
+        # Sem fuso não dá para comparar com a data de criação dos eventos.
+        logger.warning("Marco de eventos novos salvo sem fuso; ignorando.")
+        return None
+
+    return marker
+
+
+def _save_new_events_marker(moment: datetime):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STATE_PATH, "w", encoding="utf-8") as state_file:
+            json.dump({"ultima_verificacao_eventos": moment.isoformat()}, state_file)
+    except OSError as e:
+        # Perder o marco só custa uma janela cega no próximo reinício.
+        logger.error(f"Não foi possível salvar o estado de notificações: {e}")
+
+
 def _event_created_at(event: dict) -> datetime | None:
     """Momento em que o evento foi criado, como datetime com fuso."""
     created = event.get("created")
@@ -121,14 +170,26 @@ async def check_new_events(app):
     """
     global new_events_since
 
+    cycle_started_at = now_local()
+
     if new_events_since is None:
-        # Primeiro ciclo apenas marca o ponto de partida: o que já existia
-        # não é novidade. Evita enxurrada de avisos a cada reinício.
-        new_events_since = now_local()
-        return
+        new_events_since = _load_new_events_marker()
+
+        if new_events_since is None:
+            # Primeira execução: o que já existe não é novidade.
+            new_events_since = cycle_started_at
+            _save_new_events_marker(cycle_started_at)
+            return
+
+        # Recupera o que apareceu enquanto o bot esteve fora do ar, mas sem
+        # despejar o acumulado de dias depois de uma parada longa.
+        oldest_allowed = cycle_started_at - MAX_RECOVERY_WINDOW
+        if new_events_since < oldest_allowed:
+            new_events_since = oldest_allowed
 
     users = load_users()
     bot = app.bot
+    fetch_failed = False
 
     for telegram_id, user_data in users.items():
         user_id = user_data.get("name")
@@ -142,6 +203,7 @@ async def check_new_events(app):
         except Exception as e:
             logger.error(f"Erro ao buscar eventos novos de {user_id}: {e}")
             bot_stats["errors_count"] += 1
+            fetch_failed = True
             continue
 
         for event in events:
@@ -159,6 +221,12 @@ async def check_new_events(app):
             except Exception as e:
                 logger.error(f"Erro ao avisar evento novo para {user_id}: {e}")
                 bot_stats["errors_count"] += 1
+
+    # Só avança o marco se a rodada foi completa. Com falha de busca, os
+    # eventos daquele usuário seriam pulados para sempre.
+    if not fetch_failed:
+        new_events_since = cycle_started_at
+        _save_new_events_marker(cycle_started_at)
 
 
 async def check_reminders(app):

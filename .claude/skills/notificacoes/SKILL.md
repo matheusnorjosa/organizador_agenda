@@ -27,11 +27,18 @@ Use as chaves de deduplicação:
 - Notificação de horário: `notification_key(tipo, usuario, hora)` → `sent_notifications`
 - Aviso por evento: `f"new:{usuario}:{evento_id}"` → `announced_new_events`
 
-### 2. Enxurrada a cada deploy
+### 2. Enxurrada a cada deploy — e a janela cega ao evitá-la
 
 Deploy reinicia o container e **zera o estado em memória**. Uma verificação do tipo "avise sobre o que apareceu" anunciaria a agenda inteira a cada deploy.
 
-Solução usada em `check_new_events`: um marco temporal definido no **primeiro ciclo** (`new_events_since`). O que já existia quando o processo subiu não é novidade.
+Solução em `check_new_events`: um marco temporal (`new_events_since`). Mas atenção ao efeito colateral — quando esse marco vivia **só em memória**, cada deploy criava uma **janela cega**: evento criado antes do restart nunca era anunciado. Foi um bug real relatado pelo usuário.
+
+Hoje o marco é **persistido em `estado/notificacoes.json`**:
+- sem arquivo (primeira execução) → marco vira "agora", não anuncia nada;
+- com arquivo → recupera o que apareceu durante a parada, limitado a `MAX_RECOVERY_WINDOW` (24h);
+- só avança se o ciclo terminou sem falha de busca.
+
+**Qualquer estado novo que precise sobreviver a restart tem que ficar em `estado/`**, que é volume montado. Arquivo escrito em outro lugar do container se perde no próximo deploy.
 
 ### 3. Falso positivo pela janela de busca
 

@@ -75,11 +75,23 @@ Sem controle, o laço reenviaria a mesma notificação a cada 15 minutos.
 
 ### Detecção de "evento novo"
 
-Duas decisões de design que evitam falhas reais:
+Três decisões de design que evitam falhas reais:
 
-1. **Marco temporal no primeiro ciclo** (`new_events_since`). O que já existia quando o bot subiu não é novidade. Sem isso, **todo deploy anunciaria a agenda inteira** — e deploys são frequentes.
+1. **Marco temporal persistido em disco** (`new_events_since`, em `estado/notificacoes.json`). O bot anuncia o que foi criado depois do marco e avança o marco a cada ciclo completo.
+
+   Duas coisas dependem disso:
+   - Na **primeira execução** (sem arquivo) o marco vira "agora" e nada é anunciado — senão todo deploy despejaria a agenda inteira no Telegram.
+   - Em **reinícios seguintes** o marco vem do disco, então eventos criados enquanto o bot estava fora do ar são recuperados. Quando o marco vivia só em memória, cada deploy criava uma **janela cega**: um evento criado antes do restart nunca era anunciado.
+
+   Depois de uma parada longa a recuperação é limitada a `MAX_RECOVERY_WINDOW` (24h), para não despejar dias de eventos de uma vez.
+
+   O marco **não avança se a busca falhar** para algum usuário — avançar puliria aqueles eventos para sempre.
 
 2. **Usa o campo `created` do evento, não a presença dele.** A busca olha 30 dias à frente (`NEW_EVENT_LOOKAHEAD_DAYS`); um compromisso marcado para daqui a 40 dias entraria nessa janela sozinho com o passar do tempo e seria anunciado como "novo" sem ninguém ter criado nada.
+
+3. **Chave por evento/usuário** (`announced_new_events`, em memória) evita repetir o aviso dentro da mesma execução.
+
+> **O diretório `estado/` precisa estar montado como volume.** O container é recriado a cada deploy; sem o volume o arquivo se perde e a persistência não serve para nada. Está declarado em `deploy.yml`, `deploy.sh` e `docker-compose.yml`.
 
 ## Modelo de domínio: agendas compartilhadas
 
