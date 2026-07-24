@@ -35,6 +35,16 @@ WEEKLY_SUMMARY_DAY = 6
 # Agendas conjuntas do casal: compromissos comuns, nunca conflito entre os dois.
 SHARED_COUPLE_CALENDARS = {"familia", "família"}
 
+# Janela de busca para avisar sobre compromissos recém-criados
+NEW_EVENT_LOOKAHEAD_DAYS = 30
+
+# Eventos já anunciados como novos, para não repetir o aviso a cada ciclo
+announced_new_events: set[str] = set()
+
+# A partir de quando um evento conta como novo. Só é definido no primeiro
+# ciclo: assim o que já existia não vira enxurrada de avisos a cada deploy.
+new_events_since: datetime | None = None
+
 # Controle para não enviar notificações duplicadas
 sent_notifications: set[str] = set()
 
@@ -81,6 +91,74 @@ async def send_error_alert(bot, error_message: str):
         await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
     except Exception:
         pass
+
+
+def _event_created_at(event: dict) -> datetime | None:
+    """Momento em que o evento foi criado, como datetime com fuso."""
+    created = event.get("created")
+    if not created:
+        return None
+    try:
+        return datetime.fromisoformat(created.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_new_event(event: dict) -> str:
+    creator = event.get("creator") or {}
+    author = creator.get("displayName") or creator.get("email")
+    text = f"🆕 *Novo compromisso na agenda*\n\n{format_event(event)}"
+    if author:
+        text += f"\n\nAdicionado por {author}"
+    return text
+
+
+async def check_new_events(app):
+    """Avisa quando um compromisso novo aparece na agenda.
+
+    Os lembretes de horário fixo não cobrem o que é criado no meio do dia:
+    um evento marcado às 9h para as 19h não gerava aviso nenhum.
+    """
+    global new_events_since
+
+    if new_events_since is None:
+        # Primeiro ciclo apenas marca o ponto de partida: o que já existia
+        # não é novidade. Evita enxurrada de avisos a cada reinício.
+        new_events_since = now_local()
+        return
+
+    users = load_users()
+    bot = app.bot
+
+    for telegram_id, user_data in users.items():
+        user_id = user_data.get("name")
+        if not user_id or not is_user_authenticated(user_id):
+            continue
+        if is_user_silenced(int(telegram_id)):
+            continue
+
+        try:
+            events = get_events(user_id, days_ahead=NEW_EVENT_LOOKAHEAD_DAYS)
+        except Exception as e:
+            logger.error(f"Erro ao buscar eventos novos de {user_id}: {e}")
+            bot_stats["errors_count"] += 1
+            continue
+
+        for event in events:
+            created_at = _event_created_at(event)
+            if created_at is None or created_at <= new_events_since:
+                continue
+
+            key = f"new:{user_id}:{event.get('id', '')}"
+            if key in announced_new_events:
+                continue
+            announced_new_events.add(key)
+
+            try:
+                await send_message(bot, telegram_id, _format_new_event(event))
+            except Exception as e:
+                logger.error(f"Erro ao avisar evento novo para {user_id}: {e}")
+                bot_stats["errors_count"] += 1
 
 
 async def check_reminders(app):
@@ -324,6 +402,7 @@ async def notification_loop(app):
     while True:
         try:
             cleanup_old_keys()
+            await check_new_events(app)
             await check_reminders(app)
             await check_daily_summary(app)
             await check_weekly_summary(app)
