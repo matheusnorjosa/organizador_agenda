@@ -3,8 +3,15 @@ name: Deploy
 on:
   push:
     branches: [main]
-  # Merges via auto-merge usam o GITHUB_TOKEN e não disparam este workflow.
-  # O disparo manual cobre esses casos: gh workflow run deploy.yml
+    # Só o que entra na imagem justifica reiniciar o bot. Mudança em docs/,
+    # tests/ ou .claude/ não afeta o container.
+    paths:
+      - 'src/**'
+      - 'requirements.txt'
+      - 'Dockerfile'
+  # O disparo automático acima só funciona se o merge for feito com um PAT
+  # (ver docs/setup_pat.md). Com o GITHUB_TOKEN o GitHub não encadeia
+  # workflows, e aí este é o único caminho: gh workflow run deploy.yml
   workflow_dispatch:
 
 jobs:
