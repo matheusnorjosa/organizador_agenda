@@ -9,15 +9,33 @@ Produção = **container Docker numa VM Oracle**, atualizado por GitHub Actions.
 
 ## A pegadinha principal
 
-O auto-merge usa `GITHUB_TOKEN`, e o GitHub **não dispara workflows a partir de commits feitos por esse token** (proteção contra loops). Logo o `deploy.yml` (`on: push` na main) **não roda sozinho depois do merge**.
+Se o auto-merge usa o `GITHUB_TOKEN`, o GitHub **não dispara workflows a partir de commits feitos por esse token** (proteção contra loops). Logo o `deploy.yml` **não roda sozinho depois do merge** — e a branch também não é apagada.
 
-Sintoma: o PR aparece mergeado, tudo verde, e o bot continua rodando a versão antiga. Já aconteceu — o último deploy automático foi meses antes de alguém notar.
+Sintoma: o PR aparece mergeado, tudo verde, e o bot continua rodando a versão antiga.
 
-**Sempre disparar à mão depois do merge:**
+**Como saber em qual cenário você está:**
 
 ```bash
-gh workflow run deploy.yml
+gh secret list | grep AUTO_MERGE_PAT
 ```
+
+| Resultado | Comportamento |
+|---|---|
+| Secret existe | Deploy dispara sozinho (se o PR mexeu em `src/`, `requirements.txt` ou `Dockerfile`) e a branch some sozinha |
+| Secret não existe | Cai no `GITHUB_TOKEN`: **disparar à mão** e apagar a branch à mão |
+
+```bash
+gh workflow run deploy.yml                 # publicar
+git push origin --delete <branch>          # limpar
+```
+
+Na dúvida, **confirme que o deploy rodou depois do merge** em vez de supor:
+
+```bash
+gh run list --workflow=deploy.yml --limit 1
+```
+
+Ligar o modo automático: `docs/setup_pat.md`.
 
 ## Fluxo completo
 
@@ -38,10 +56,10 @@ gh pr create --base main --title "..." --body "..."
 # 5. Confirmar o merge
 gh pr view <n> --json state -q .state
 
-# 6. Deploy (o passo que não é automático)
+# 6. Deploy — só necessário se o AUTO_MERGE_PAT não estiver configurado
 gh workflow run deploy.yml
 
-# 7. Confirmar que subiu
+# 7. Confirmar que subiu (sempre confira, não suponha)
 gh run list --workflow=deploy.yml --limit 1
 ```
 

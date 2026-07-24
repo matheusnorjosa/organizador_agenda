@@ -137,14 +137,17 @@ O projeto usa GitHub Actions com três workflows:
 - **Auto-merge** — Faz merge (squash) do PR quando os testes passam
 - **Deploy** — Atualiza o container na VM: `git pull` + rebuild + restart
 
-> **Atenção:** o deploy **não** dispara sozinho depois do auto-merge. Merges feitos pelo
-> `GITHUB_TOKEN` não acionam outros workflows (proteção do GitHub contra loops). Depois do
-> merge, publique com:
+O deploy roda apenas quando o PR mexe em `src/`, `requirements.txt` ou `Dockerfile` — é o
+que entra na imagem. Mudança só em `docs/`, `tests/` ou `.claude/` não reinicia o bot.
+
+> **Atenção:** por padrão, o deploy **não** dispara sozinho depois do auto-merge. Merges
+> feitos pelo `GITHUB_TOKEN` não acionam outros workflows (proteção do GitHub contra
+> loops), e a branch também não é apagada. Nesse caso, publique com:
 > ```bash
 > gh workflow run deploy.yml
 > ```
-> Mudança apenas em `docs/`, `tests/` ou `.claude/` não precisa de deploy — o `Dockerfile`
-> só copia `src/`.
+> Para deixar automático, configure o secret `AUTO_MERGE_PAT` —
+> veja [docs/setup_pat.md](docs/setup_pat.md).
 
 ## Testes
 

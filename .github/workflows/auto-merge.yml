@@ -15,6 +15,11 @@ jobs:
       - name: Ativar auto-merge
         uses: peter-evans/enable-pull-request-automerge@v3
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Merge feito pelo GITHUB_TOKEN não dispara outros workflows (proteção
+          # do GitHub contra loops) nem aciona a exclusão automática da branch.
+          # Com o PAT, o deploy volta a ser automático e a branch some sozinha.
+          # Sem o secret configurado, cai no GITHUB_TOKEN e nada muda.
+          # Passo a passo para criar o PAT: docs/setup_pat.md
+          token: ${{ secrets.AUTO_MERGE_PAT || secrets.GITHUB_TOKEN }}
           pull-request-number: ${{ github.event.pull_request.number }}
           merge-method: squash
