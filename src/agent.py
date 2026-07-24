@@ -32,6 +32,9 @@ DAILY_SUMMARY_HOUR = 7
 WEEKLY_SUMMARY_HOUR = 20
 WEEKLY_SUMMARY_DAY = 6
 
+# Agendas conjuntas do casal: compromissos comuns, nunca conflito entre os dois.
+SHARED_COUPLE_CALENDARS = {"familia", "família"}
+
 # Controle para não enviar notificações duplicadas
 sent_notifications: set[str] = set()
 
@@ -189,6 +192,52 @@ async def check_weekly_summary(app):
             await send_error_alert(app.bot, f"Erro resumo semanal ({user_id}): {e}")
 
 
+def _is_shared_couple_event(event: dict) -> bool:
+    """Evento de agenda conjunta do casal (ex: Família)."""
+    calendar_name = event.get("_calendar_name") or ""
+    return calendar_name.strip().lower() in SHARED_COUPLE_CALENDARS
+
+
+def _timed_events(events: list[dict], tz) -> list[tuple[dict, datetime, datetime]]:
+    """Eventos com hora marcada, já convertidos para o fuso local.
+
+    Descarta eventos de agenda conjunta: são compromissos comuns do casal,
+    não disputa de horário entre os dois.
+    """
+    timed = []
+    for event in events:
+        start = event.get("start", {})
+        end = event.get("end", {})
+        if "dateTime" not in start or "dateTime" not in end:
+            continue
+        if _is_shared_couple_event(event):
+            continue
+        timed.append((
+            event,
+            datetime.fromisoformat(start["dateTime"]).astimezone(tz),
+            datetime.fromisoformat(end["dateTime"]).astimezone(tz),
+        ))
+    return timed
+
+
+def _event_identity(event: dict, start: datetime, end: datetime) -> tuple:
+    """Chave que identifica a mesma ocorrência vista em agendas diferentes."""
+    return ((event.get("summary") or "").strip().lower(), start, end)
+
+
+def _is_same_event(ev_a: dict, identity_a: tuple, ev_b: dict, identity_b: tuple) -> bool:
+    """Mesmo evento aparecendo nas duas listas.
+
+    As agendas do casal são compartilhadas, então o evento de um também
+    aparece na lista do outro. Comparar os dois não pode virar conflito.
+    """
+    if ev_a.get("id") and ev_a.get("id") == ev_b.get("id"):
+        return True
+    if ev_a.get("iCalUID") and ev_a.get("iCalUID") == ev_b.get("iCalUID"):
+        return True
+    return identity_a == identity_b
+
+
 async def check_couple_conflicts(app):
     """Verifica conflitos de horário entre os dois usuários."""
     current_hour = now_local().hour
@@ -214,6 +263,7 @@ async def check_couple_conflicts(app):
 
     # Verifica conflitos para os próximos 3 dias
     conflicts_found = []
+    reported_pairs = set()
     for offset in range(3):
         check_date = today + timedelta(days=offset)
 
@@ -229,33 +279,32 @@ async def check_couple_conflicts(app):
             continue
 
         user_ids = list(all_events.keys())
-        events_a = all_events[user_ids[0]]
-        events_b = all_events[user_ids[1]]
+        events_a = _timed_events(all_events[user_ids[0]], tz)
+        events_b = _timed_events(all_events[user_ids[1]], tz)
 
-        for ev_a in events_a:
-            start_a = ev_a.get("start", {})
-            end_a = ev_a.get("end", {})
-            if "dateTime" not in start_a:
-                continue
+        for ev_a, a_start, a_end in events_a:
+            identity_a = _event_identity(ev_a, a_start, a_end)
 
-            a_start = datetime.fromisoformat(start_a["dateTime"]).astimezone(tz)
-            a_end = datetime.fromisoformat(end_a["dateTime"]).astimezone(tz)
+            for ev_b, b_start, b_end in events_b:
+                identity_b = _event_identity(ev_b, b_start, b_end)
 
-            for ev_b in events_b:
-                start_b = ev_b.get("start", {})
-                end_b = ev_b.get("end", {})
-                if "dateTime" not in start_b:
+                if _is_same_event(ev_a, identity_a, ev_b, identity_b):
                     continue
 
-                b_start = datetime.fromisoformat(start_b["dateTime"]).astimezone(tz)
-                b_end = datetime.fromisoformat(end_b["dateTime"]).astimezone(tz)
+                if not (a_start < b_end and b_start < a_end):
+                    continue
 
-                if a_start < b_end and b_start < a_end:
-                    day_str = check_date.strftime("%d/%m")
-                    conflicts_found.append(
-                        f"• {day_str}: {ev_a.get('summary', '?')} ({a_start.strftime('%H:%M')}) "
-                        f"x {ev_b.get('summary', '?')} ({b_start.strftime('%H:%M')})"
-                    )
+                # O mesmo par aparece espelhado nas duas listas; reporta uma vez.
+                pair = frozenset({identity_a, identity_b})
+                if pair in reported_pairs:
+                    continue
+                reported_pairs.add(pair)
+
+                day_str = check_date.strftime("%d/%m")
+                conflicts_found.append(
+                    f"• {day_str}: {ev_a.get('summary', '?')} ({a_start.strftime('%H:%M')}) "
+                    f"x {ev_b.get('summary', '?')} ({b_start.strftime('%H:%M')})"
+                )
 
     if conflicts_found:
         text = "⚠️ *Conflitos de agenda do casal:*\n\n" + "\n".join(conflicts_found)
