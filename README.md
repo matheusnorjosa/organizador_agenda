@@ -6,6 +6,7 @@ Bot do Telegram que integra Google Calendar, Google Tasks e Google Contacts para
 
 ### Agenda
 - Lembretes automáticos (1 dia antes e no dia)
+- Aviso quando um compromisso novo é criado, informando quem adicionou
 - Resumo diário às 7h com eventos separados por período (manhã, tarde, noite)
 - Resumo semanal todo domingo com programação dia a dia
 - Criar, editar e excluir eventos pelo Telegram
@@ -22,7 +23,8 @@ Bot do Telegram que integra Google Calendar, Google Tasks e Google Contacts para
 
 ### Casal
 - Agenda compartilhada do casal lado a lado
-- Detecção automática de conflitos de horário
+- Detecção automática de conflitos de horário — ignora o mesmo evento visto nas duas
+  agendas compartilhadas e os compromissos da agenda conjunta `Família`
 - Criar evento nas agendas de todos os usuários
 
 ### Outros
@@ -52,6 +54,9 @@ src/
 ├── natural_language.py # Interpretação de linguagem natural via IA
 └── auth.py            # Script de autenticação local
 ```
+
+Detalhes de arquitetura, regras de fuso horário, laço de notificações e o modelo de agendas
+compartilhadas: [docs/arquitetura.md](docs/arquitetura.md).
 
 ## Comandos do Telegram
 
@@ -126,16 +131,32 @@ docker run -d --name organizador-agenda --restart unless-stopped \
 
 ## CI/CD
 
-O projeto usa GitHub Actions com dois workflows:
+O projeto usa GitHub Actions com três workflows:
 
 - **Testes** — Roda automaticamente em cada Pull Request para `main`
-- **Deploy** — Após merge na `main`, faz deploy automático na VM
+- **Auto-merge** — Faz merge (squash) do PR quando os testes passam
+- **Deploy** — Atualiza o container na VM: `git pull` + rebuild + restart
+
+> **Atenção:** o deploy **não** dispara sozinho depois do auto-merge. Merges feitos pelo
+> `GITHUB_TOKEN` não acionam outros workflows (proteção do GitHub contra loops). Depois do
+> merge, publique com:
+> ```bash
+> gh workflow run deploy.yml
+> ```
+> Mudança apenas em `docs/`, `tests/` ou `.claude/` não precisa de deploy — o `Dockerfile`
+> só copia `src/`.
 
 ## Testes
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests/ -v
+TIMEZONE=America/Fortaleza pytest tests/ -v
+```
+
+Rode também simulando o servidor, que roda em UTC — é onde bugs de fuso aparecem:
+
+```bash
+TZ=UTC TIMEZONE=America/Fortaleza pytest tests/ -q
 ```
 
 ## Licença
