@@ -1,11 +1,13 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from src.agent import (
+    announced_new_events,
     check_couple_conflicts,
     check_daily_summary,
+    check_new_events,
     check_reminders,
     cleanup_old_keys,
     notification_key,
@@ -252,3 +254,91 @@ class TestCheckCoupleConflicts:
         })
         text = self._sent_text(app)
         assert text.count("Dentista") == 1
+
+
+AGORA = datetime(2026, 7, 24, 9, 0, tzinfo=FORTALEZA)
+
+
+class TestCheckNewEvents:
+    # Os lembretes de horário fixo não cobrem o que é criado no meio do dia:
+    # um evento marcado às 9h para as 19h não gerava aviso nenhum.
+
+    def setup_method(self):
+        announced_new_events.clear()
+
+    def _make_app(self):
+        app = MagicMock()
+        app.bot = MagicMock()
+        app.bot.send_message = AsyncMock()
+        return app
+
+    def _event(self, event_id: str, summary: str, created_at: datetime) -> dict:
+        start = datetime(2026, 7, 24, 19, 0, tzinfo=FORTALEZA)
+        return {
+            "id": event_id,
+            "summary": summary,
+            # Formato que o Google devolve (UTC com sufixo Z)
+            "created": created_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "start": {"dateTime": start.isoformat()},
+            "end": {"dateTime": (start + timedelta(hours=1)).isoformat()},
+        }
+
+    def _run(self, events: list[dict], baseline: datetime | None, silenced: bool = False):
+        app = self._make_app()
+        with patch.multiple(
+            "src.agent",
+            new_events_since=baseline,
+            now_local=MagicMock(return_value=AGORA),
+            load_users=MagicMock(return_value={
+                "1": {"name": "matheus"},
+                "2": {"name": "cecilia"},
+            }),
+            is_user_authenticated=MagicMock(return_value=True),
+            is_user_silenced=MagicMock(return_value=silenced),
+            get_events=MagicMock(return_value=events),
+        ):
+            asyncio.run(check_new_events(app))
+        return app
+
+    def test_first_cycle_does_not_announce_existing_events(self):
+        # Protege contra enxurrada de avisos a cada deploy/reinício.
+        event = self._event("e1", "Sair", AGORA)
+        app = self._run([event], baseline=None)
+        assert app.bot.send_message.await_count == 0
+
+    def test_announces_event_created_during_the_day_to_both(self):
+        # Cenário real: marcado às 9h um compromisso para as 19h.
+        event = self._event("e1", "Sair", AGORA - timedelta(minutes=5))
+        app = self._run([event], baseline=AGORA - timedelta(minutes=15))
+
+        assert app.bot.send_message.await_count == 2
+        text = app.bot.send_message.await_args.kwargs["text"]
+        assert "Novo compromisso" in text
+        assert "Sair" in text
+
+    def test_does_not_announce_the_same_event_twice(self):
+        event = self._event("e1", "Sair", AGORA - timedelta(minutes=5))
+        baseline = AGORA - timedelta(minutes=15)
+
+        self._run([event], baseline=baseline)
+        app = self._run([event], baseline=baseline)
+
+        assert app.bot.send_message.await_count == 0
+
+    def test_ignores_event_created_before_the_baseline(self):
+        event = self._event("e1", "Compromisso antigo", AGORA - timedelta(days=2))
+        app = self._run([event], baseline=AGORA - timedelta(minutes=15))
+        assert app.bot.send_message.await_count == 0
+
+    def test_does_not_announce_to_silenced_user(self):
+        event = self._event("e1", "Sair", AGORA - timedelta(minutes=5))
+        app = self._run([event], baseline=AGORA - timedelta(minutes=15), silenced=True)
+        assert app.bot.send_message.await_count == 0
+
+    def test_shows_who_added_the_event(self):
+        event = self._event("e1", "Sair", AGORA - timedelta(minutes=5))
+        event["creator"] = {"displayName": "Matheus Norjosa"}
+        app = self._run([event], baseline=AGORA - timedelta(minutes=15))
+
+        text = app.bot.send_message.await_args.kwargs["text"]
+        assert "Matheus Norjosa" in text
