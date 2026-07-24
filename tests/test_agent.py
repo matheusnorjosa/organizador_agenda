@@ -259,9 +259,8 @@ class TestCheckCoupleConflicts:
 AGORA = datetime(2026, 7, 24, 9, 0, tzinfo=FORTALEZA)
 
 
-class TestCheckNewEvents:
-    # Os lembretes de horário fixo não cobrem o que é criado no meio do dia:
-    # um evento marcado às 9h para as 19h não gerava aviso nenhum.
+class _BaseAvisoEventoNovo:
+    """Infraestrutura compartilhada pelos testes de aviso de evento novo."""
 
     def setup_method(self):
         announced_new_events.clear()
@@ -283,8 +282,22 @@ class TestCheckNewEvents:
             "end": {"dateTime": (start + timedelta(hours=1)).isoformat()},
         }
 
-    def _run(self, events: list[dict], baseline: datetime | None, silenced: bool = False):
+    def _run(
+        self,
+        events: list[dict],
+        baseline: datetime | None,
+        silenced: bool = False,
+        marco_salvo: datetime | None = None,
+        falha_na_busca: bool = False,
+    ):
+        """Roda um ciclo. `marco_salvo` simula o que estava gravado em disco."""
         app = self._make_app()
+        self.salvar_marco = MagicMock()
+        buscar_eventos = (
+            MagicMock(side_effect=RuntimeError("API fora do ar"))
+            if falha_na_busca
+            else MagicMock(return_value=events)
+        )
         with patch.multiple(
             "src.agent",
             new_events_since=baseline,
@@ -295,10 +308,17 @@ class TestCheckNewEvents:
             }),
             is_user_authenticated=MagicMock(return_value=True),
             is_user_silenced=MagicMock(return_value=silenced),
-            get_events=MagicMock(return_value=events),
+            get_events=buscar_eventos,
+            _load_new_events_marker=MagicMock(return_value=marco_salvo),
+            _save_new_events_marker=self.salvar_marco,
         ):
             asyncio.run(check_new_events(app))
         return app
+
+
+class TestCheckNewEvents(_BaseAvisoEventoNovo):
+    # Os lembretes de horário fixo não cobrem o que é criado no meio do dia:
+    # um evento marcado às 9h para as 19h não gerava aviso nenhum.
 
     def test_first_cycle_does_not_announce_existing_events(self):
         # Protege contra enxurrada de avisos a cada deploy/reinício.
@@ -342,3 +362,50 @@ class TestCheckNewEvents:
 
         text = app.bot.send_message.await_args.kwargs["text"]
         assert "Matheus Norjosa" in text
+
+
+class TestMarcoPersistido(_BaseAvisoEventoNovo):
+    # Regressão: o marco vivia só em memória, então todo deploy criava uma
+    # janela cega — evento criado antes do restart nunca era anunciado.
+
+    def test_recupera_evento_criado_enquanto_o_bot_estava_fora(self):
+        # Bot caiu às 8h30 e voltou às 9h; evento criado 8h50, durante a parada.
+        evento = self._event("e1", "Sair", AGORA - timedelta(minutes=10))
+        app = self._run(
+            [evento],
+            baseline=None,
+            marco_salvo=AGORA - timedelta(minutes=30),
+        )
+        assert app.bot.send_message.await_count == 2
+
+    def test_primeira_execucao_sem_estado_nao_anuncia_e_grava_o_marco(self):
+        evento = self._event("e1", "Antigo", AGORA - timedelta(hours=2))
+        app = self._run([evento], baseline=None, marco_salvo=None)
+
+        assert app.bot.send_message.await_count == 0
+        self.salvar_marco.assert_called_once_with(AGORA)
+
+    def test_nao_despeja_o_acumulado_depois_de_parada_longa(self):
+        # Marco de 5 dias atrás: só recupera a janela de 24h, não tudo.
+        antigo = self._event("e1", "De 3 dias atrás", AGORA - timedelta(days=3))
+        recente = self._event("e2", "De 1 hora atrás", AGORA - timedelta(hours=1))
+        app = self._run(
+            [antigo, recente],
+            baseline=None,
+            marco_salvo=AGORA - timedelta(days=5),
+        )
+
+        assert app.bot.send_message.await_count == 2
+        textos = " ".join(c.kwargs["text"] for c in app.bot.send_message.await_args_list)
+        assert "De 1 hora atrás" in textos
+        assert "De 3 dias atrás" not in textos
+
+    def test_avanca_o_marco_apos_ciclo_bem_sucedido(self):
+        evento = self._event("e1", "Sair", AGORA - timedelta(minutes=5))
+        self._run([evento], baseline=AGORA - timedelta(minutes=15))
+        self.salvar_marco.assert_called_once_with(AGORA)
+
+    def test_nao_avanca_o_marco_quando_a_busca_falha(self):
+        # Avançar aqui faria os eventos daquele usuário serem pulados para sempre.
+        self._run([], baseline=AGORA - timedelta(minutes=15), falha_na_busca=True)
+        self.salvar_marco.assert_not_called()
