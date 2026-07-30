@@ -51,30 +51,36 @@ class TestCheckReminders:
         app.bot.send_message = AsyncMock()
         return app
 
-    def _make_event(self, event_id: str, summary: str) -> dict:
-        tz = ZoneInfo("America/Sao_Paulo")
-        start = datetime.now(tz) + timedelta(hours=1)
+    def _make_event(self, event_id: str, summary: str, start: datetime | None = None) -> dict:
+        start = start or now_local() + timedelta(hours=1)
         return {
             "id": event_id,
             "summary": summary,
             "start": {"dateTime": start.isoformat()},
+            "end": {"dateTime": (start + timedelta(hours=1)).isoformat()},
         }
 
-    def _patch_agent(self, get_events_mock, reminder_hours):
+    def _patch_agent(self, events_for_date_mock, reminder_hours):
         return patch.multiple(
             "src.agent",
             REMINDER_HOURS=reminder_hours,
             load_users=MagicMock(return_value={"123": {"name": "matheus"}}),
             is_user_authenticated=MagicMock(return_value=True),
             is_user_silenced=MagicMock(return_value=False),
-            get_events=get_events_mock,
+            get_events_for_date=events_for_date_mock,
+        )
+
+    def _only_on(self, day, events: list[dict]):
+        """Mock de agenda: os eventos existem apenas no dia informado."""
+        return MagicMock(
+            side_effect=lambda user_id, check_date: events if check_date == day else []
         )
 
     def test_sends_day_events_once_across_loop_iterations(self):
         # Regressão: as chaves de deduplicação eram apagadas a cada ciclo
         # e os lembretes eram reenviados até a hora do evento.
+        today = now_local().date()
         event = self._make_event("evt1", "Consulta")
-        get_events_mock = MagicMock(return_value=[event])
         app = self._make_app()
         current_hour = now_local().hour
 
@@ -84,35 +90,92 @@ class TestCheckReminders:
             cleanup_old_keys()
             await check_reminders(app)
 
-        with self._patch_agent(get_events_mock, [current_hour]):
+        with self._patch_agent(self._only_on(today, [event]), [current_hour]):
             asyncio.run(run_two_cycles())
 
         assert app.bot.send_message.await_count == 1
 
     def test_sends_today_and_tomorrow_sections(self):
+        today = now_local().date()
         today_event = self._make_event("evt1", "Consulta")
-        tomorrow_event = self._make_event("evt2", "Reunião")
+        tomorrow_event = self._make_event(
+            "evt2", "Reunião", start=now_local() + timedelta(days=1)
+        )
 
-        def fake_get_events(user_id, days_ahead=1):
-            if days_ahead == 1:
+        def fake_events(user_id, check_date):
+            if check_date == today:
                 return [today_event]
-            return [today_event, tomorrow_event]
+            return [tomorrow_event]
 
         app = self._make_app()
         current_hour = now_local().hour
 
-        with self._patch_agent(MagicMock(side_effect=fake_get_events), [current_hour]):
+        with self._patch_agent(MagicMock(side_effect=fake_events), [current_hour]):
             asyncio.run(check_reminders(app))
 
         assert app.bot.send_message.await_count == 2
 
     def test_does_not_send_outside_reminder_hours(self):
+        today = now_local().date()
         event = self._make_event("evt1", "Consulta")
-        get_events_mock = MagicMock(return_value=[event])
         app = self._make_app()
         other_hour = (now_local().hour + 2) % 24
 
-        with self._patch_agent(get_events_mock, [other_hour]):
+        with self._patch_agent(self._only_on(today, [event]), [other_hour]):
+            asyncio.run(check_reminders(app))
+
+        assert app.bot.send_message.await_count == 0
+
+    def test_consulta_somente_as_datas_de_hoje_e_amanha(self):
+        # Regressão: a busca usava janelas de 24h/48h a partir de agora, então
+        # às 20h a faixa "amanhã" ia até as 20h de depois de amanhã.
+        today = now_local().date()
+        buscar = MagicMock(return_value=[])
+
+        with self._patch_agent(buscar, [now_local().hour]):
+            asyncio.run(check_reminders(self._make_app()))
+
+        datas_consultadas = [chamada.args[1] for chamada in buscar.call_args_list]
+        assert datas_consultadas == [today, today + timedelta(days=1)]
+
+    def test_nao_anuncia_evento_de_depois_de_amanha(self):
+        # Caso real: em 29/07 às 20h o bot anunciou como "Eventos de amanhã"
+        # um compromisso que começava em 31/07.
+        today = now_local().date()
+        evento = self._make_event(
+            "evt", "Caponga", start=now_local() + timedelta(days=2)
+        )
+        app = self._make_app()
+
+        with self._patch_agent(
+            self._only_on(today + timedelta(days=2), [evento]), [now_local().hour]
+        ):
+            asyncio.run(check_reminders(app))
+
+        assert app.bot.send_message.await_count == 0
+
+    def test_evento_de_varios_dias_nao_sai_em_hoje_e_amanha(self):
+        # Um compromisso que atravessa os dois dias cai nas duas buscas;
+        # repetido nas duas mensagens, parece erro para quem lê.
+        longo = self._make_event("cap", "Caponga", start=now_local() + timedelta(hours=2))
+        longo["end"] = {"dateTime": (now_local() + timedelta(days=2)).isoformat()}
+        app = self._make_app()
+
+        with self._patch_agent(MagicMock(return_value=[longo]), [now_local().hour]):
+            asyncio.run(check_reminders(app))
+
+        assert app.bot.send_message.await_count == 1
+        assert "hoje" in app.bot.send_message.await_args.kwargs["text"].lower()
+
+    def test_nao_lembra_evento_que_ja_terminou(self):
+        # O lembrete das 20h buscava o dia inteiro e traria a consulta da manhã.
+        today = now_local().date()
+        encerrado = self._make_event(
+            "evt", "Já passou", start=now_local() - timedelta(hours=3)
+        )
+        app = self._make_app()
+
+        with self._patch_agent(self._only_on(today, [encerrado]), [now_local().hour]):
             asyncio.run(check_reminders(app))
 
         assert app.bot.send_message.await_count == 0

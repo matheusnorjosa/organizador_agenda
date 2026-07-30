@@ -8,6 +8,7 @@ from src.calendar_api import (
     format_event_short,
     format_task,
     format_events_by_period,
+    drop_finished_events,
     now_local,
     _calc_duration_str,
     _fetch_events_from_all_calendars,
@@ -32,6 +33,17 @@ class TestCalcDurationStr:
         start = datetime(2026, 4, 10, 14, 0)
         end = datetime(2026, 4, 10, 15, 30)
         assert _calc_duration_str(start, end) == "1h30min"
+
+    def test_returns_days_and_hours_for_multi_day_event(self):
+        # Antes saía "47h", que não se lê como quase dois dias.
+        start = datetime(2026, 7, 31, 18, 0)
+        end = datetime(2026, 8, 2, 17, 0)
+        assert _calc_duration_str(start, end) == "1d23h"
+
+    def test_returns_only_days_when_exact(self):
+        start = datetime(2026, 7, 31, 18, 0)
+        end = datetime(2026, 8, 2, 18, 0)
+        assert _calc_duration_str(start, end) == "2d"
 
 
 class TestGetPeriod:
@@ -255,6 +267,60 @@ class TestFetchEventsTimezone:
 
         _, kwargs = mock_service.events.return_value.list.call_args
         assert kwargs["timeZone"] == "America/Sao_Paulo"
+
+
+class TestEventosDeVariosDias:
+    # Regressão: um evento de 31/07 18:00 a 02/08 17:00 era exibido como
+    # "31/07/2026 18:00 às 17:00 (47h)" — parecia terminar antes de começar.
+
+    CAPONGA = {
+        "summary": "Caponga",
+        "start": {"dateTime": "2026-07-31T18:00:00-03:00"},
+        "end": {"dateTime": "2026-08-02T17:00:00-03:00"},
+    }
+
+    def test_format_event_mostra_a_data_do_fim(self):
+        with patch.dict(os.environ, {"TIMEZONE": "America/Fortaleza"}):
+            result = format_event(self.CAPONGA)
+        assert "31/07/2026 18:00" in result
+        assert "02/08/2026 17:00" in result
+        assert "1d23h" in result
+
+    def test_format_event_short_mostra_a_data_do_fim_sem_o_ano(self):
+        with patch.dict(os.environ, {"TIMEZONE": "America/Fortaleza"}):
+            result = format_event_short(self.CAPONGA)
+        assert "18:00 às 02/08 17:00" in result
+
+    def test_evento_do_mesmo_dia_nao_repete_a_data(self):
+        event = {
+            "summary": "Reunião",
+            "start": {"dateTime": "2026-07-31T14:00:00-03:00"},
+            "end": {"dateTime": "2026-07-31T15:00:00-03:00"},
+        }
+        with patch.dict(os.environ, {"TIMEZONE": "America/Fortaleza"}):
+            result = format_event(event)
+        assert "14:00 às 15:00" in result
+        assert result.count("31/07") == 1
+
+
+class TestDropFinishedEvents:
+    def _event(self, event_id: str, end: str) -> dict:
+        return {"id": event_id, "end": {"dateTime": end}}
+
+    def test_remove_evento_ja_encerrado(self):
+        referencia = datetime(2026, 7, 31, 20, 0, tzinfo=ZoneInfo("America/Fortaleza"))
+        encerrado = self._event("passado", "2026-07-31T18:00:00-03:00")
+        assert drop_finished_events([encerrado], referencia) == []
+
+    def test_mantem_evento_em_andamento(self):
+        referencia = datetime(2026, 7, 31, 20, 0, tzinfo=ZoneInfo("America/Fortaleza"))
+        em_curso = self._event("agora", "2026-07-31T22:00:00-03:00")
+        assert drop_finished_events([em_curso], referencia) == [em_curso]
+
+    def test_mantem_evento_de_dia_todo_sem_hora_de_fim(self):
+        referencia = datetime(2026, 7, 31, 20, 0, tzinfo=ZoneInfo("America/Fortaleza"))
+        dia_todo = {"id": "feriado", "start": {"date": "2026-07-31"}}
+        assert drop_finished_events([dia_todo], referencia) == [dia_todo]
 
 
 class TestRecurrenceMap:

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from src.calendar_api import (
+    drop_finished_events,
     get_events,
     get_events_for_date,
     format_event,
@@ -249,16 +250,30 @@ async def check_reminders(app):
             continue
 
         try:
-            today_events = get_events(user_id, days_ahead=1)
+            # Datas de calendário, não janelas de 24h a partir de agora: uma
+            # janela deslizante rotulava como "amanhã" evento de depois de
+            # amanhã, dependendo da hora em que o lembrete saía.
+            now = now_local()
+            today = now.date()
+
+            today_events = drop_finished_events(
+                get_events_for_date(user_id, today), now
+            )
             if today_events:
                 lines = [format_event(ev) for ev in today_events]
                 text = "🔔 *Eventos de hoje*\n\n" + "\n".join(lines)
                 await send_message(bot, telegram_id, text)
 
-            tomorrow_events = get_events(user_id, days_ahead=2)
-            tomorrow_only = [ev for ev in tomorrow_events if ev not in today_events]
-            if tomorrow_only:
-                lines = [format_event(ev) for ev in tomorrow_only]
+            # Evento de vários dias cai nas duas datas; listar de novo em
+            # "amanhã" o que já saiu em "hoje" parece erro para quem lê.
+            already_listed = {ev.get("id") for ev in today_events if ev.get("id")}
+            tomorrow_events = [
+                ev
+                for ev in get_events_for_date(user_id, today + timedelta(days=1))
+                if ev.get("id") not in already_listed
+            ]
+            if tomorrow_events:
+                lines = [format_event(ev) for ev in tomorrow_events]
                 text = "🔔 *Eventos de amanhã*\n\n" + "\n".join(lines)
                 await send_message(bot, telegram_id, text)
 

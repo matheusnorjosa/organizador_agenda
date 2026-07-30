@@ -263,6 +263,21 @@ def get_events_for_date(user_id: str, target_date: date) -> list[dict]:
     return _fetch_events_from_all_calendars(user_id, start.isoformat(), end.isoformat())
 
 
+def drop_finished_events(events: list[dict], reference: datetime) -> list[dict]:
+    """Descarta o que já terminou antes de `reference`.
+
+    A busca por data devolve o dia inteiro, então o lembrete da noite traria
+    compromissos da manhã que já passaram.
+    """
+    remaining = []
+    for event in events:
+        end = event.get("end", {}).get("dateTime")
+        if end and _parse_event_datetime(end) <= reference:
+            continue
+        remaining.append(event)
+    return remaining
+
+
 def get_events_between(user_id: str, start_date: date, end_date: date) -> list[dict]:
     tz = get_timezone()
     start = datetime.combine(start_date, dt_time.min, tzinfo=tz)
@@ -541,15 +556,38 @@ def _parse_event_datetime(value: str) -> datetime:
 
 
 def _calc_duration_str(start_dt: datetime, end_dt: datetime) -> str:
-    diff = end_dt - start_dt
-    total_min = int(diff.total_seconds() / 60)
+    total_min = int((end_dt - start_dt).total_seconds() / 60)
     if total_min < 60:
         return f"{total_min}min"
-    hours = total_min // 60
-    minutes = total_min % 60
-    if minutes == 0:
-        return f"{hours}h"
-    return f"{hours}h{minutes}min"
+
+    # Evento de vários dias em horas fica ilegível: "47h" em vez de "1d23h".
+    days, minutes_in_day = divmod(total_min, 24 * 60)
+    hours, minutes = divmod(minutes_in_day, 60)
+
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}min")
+    return "".join(parts)
+
+
+def _format_event_period(
+    start_dt: datetime, end_dt: datetime, end_date_format: str = "%d/%m/%Y"
+) -> str:
+    """Intervalo do evento, com a data do fim quando ele vira o dia.
+
+    Sem a data, um evento que atravessa dias aparece como "18:00 às 17:00" e
+    parece terminar antes de começar.
+    """
+    if start_dt.date() == end_dt.date():
+        return f"{start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')}"
+    return (
+        f"{start_dt.strftime('%H:%M')} às "
+        f"{end_dt.strftime(end_date_format)} {end_dt.strftime('%H:%M')}"
+    )
 
 
 def _get_period(hour: int) -> str:
@@ -585,7 +623,8 @@ def format_event(event: dict) -> str:
         start_dt = _parse_event_datetime(start["dateTime"])
         end_dt = _parse_event_datetime(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
         duration = _calc_duration_str(start_dt, end_dt)
-        return f"• {summary}{tag} — {start_dt.strftime('%d/%m/%Y')} {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} ({duration})"
+        period = _format_event_period(start_dt, end_dt)
+        return f"• {summary}{tag} — {start_dt.strftime('%d/%m/%Y')} {period} ({duration})"
 
     date_str = start.get("date", "Data indefinida")
     return f"• {summary}{tag} — {date_str} (dia todo)"
@@ -602,7 +641,9 @@ def format_event_short(event: dict) -> str:
         start_dt = _parse_event_datetime(start["dateTime"])
         end_dt = _parse_event_datetime(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
         duration = _calc_duration_str(start_dt, end_dt)
-        return f"  {start_dt.strftime('%H:%M')} às {end_dt.strftime('%H:%M')} — {summary}{tag} ({duration})"
+        # Nos resumos o ano é redundante: o dia já é o contexto.
+        period = _format_event_period(start_dt, end_dt, end_date_format="%d/%m")
+        return f"  {period} — {summary}{tag} ({duration})"
 
     return f"  Dia todo — {summary}{tag}"
 
