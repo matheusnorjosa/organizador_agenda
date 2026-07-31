@@ -574,7 +574,7 @@ def _calc_duration_str(start_dt: datetime, end_dt: datetime) -> str:
     return "".join(parts)
 
 
-def _format_event_period(
+def format_time_range(
     start_dt: datetime, end_dt: datetime, end_date_format: str = "%d/%m/%Y"
 ) -> str:
     """Intervalo do evento, com a data do fim quando ele vira o dia.
@@ -623,7 +623,7 @@ def format_event(event: dict) -> str:
         start_dt = _parse_event_datetime(start["dateTime"])
         end_dt = _parse_event_datetime(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
         duration = _calc_duration_str(start_dt, end_dt)
-        period = _format_event_period(start_dt, end_dt)
+        period = format_time_range(start_dt, end_dt)
         return f"• {summary}{tag} — {start_dt.strftime('%d/%m/%Y')} {period} ({duration})"
 
     date_str = start.get("date", "Data indefinida")
@@ -642,7 +642,7 @@ def format_event_short(event: dict) -> str:
         end_dt = _parse_event_datetime(end["dateTime"]) if "dateTime" in end else start_dt + timedelta(hours=1)
         duration = _calc_duration_str(start_dt, end_dt)
         # Nos resumos o ano é redundante: o dia já é o contexto.
-        period = _format_event_period(start_dt, end_dt, end_date_format="%d/%m")
+        period = format_time_range(start_dt, end_dt, end_date_format="%d/%m")
         return f"  {period} — {summary}{tag} ({duration})"
 
     return f"  Dia todo — {summary}{tag}"
