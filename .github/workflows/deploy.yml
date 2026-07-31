@@ -26,9 +26,30 @@ jobs:
           username: ubuntu
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
+            # Sem isto, uma falha no meio do script não interrompe o deploy e o
+            # job termina "success" com o container rodando o código antigo.
+            set -euo pipefail
+
             cd ~/organizador_agenda
-            git pull
-            docker stop organizador-agenda && docker rm organizador-agenda || true
+
+            echo "::group::Atualizando o código"
+            # git pull aborta quando há arquivo alterado na VM, e foi o que
+            # deixou a produção parada por dias reportando sucesso. O deploy
+            # espelha a main; o que é local (.env, tokens/, estado/) é
+            # gitignored e não é tocado pelo reset.
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "AVISO: alterações locais serão descartadas:"
+              git status --short
+            fi
+            git fetch origin main
+            git reset --hard origin/main
+            echo "::endgroup::"
+
+            commit_alvo=$(git rev-parse --short HEAD)
+            echo "Publicando $commit_alvo"
+
+            docker stop organizador-agenda 2>/dev/null || true
+            docker rm organizador-agenda 2>/dev/null || true
             docker build -t organizador-agenda .
             docker run -d \
               --name organizador-agenda \
@@ -39,3 +60,13 @@ jobs:
               -v $(pwd)/users.json:/app/users.json \
               -v $(pwd)/estado:/app/estado \
               organizador-agenda
+
+            # Confirma que subiu de verdade, em vez de confiar no exit code.
+            sleep 5
+            if [ -z "$(docker ps -q -f name=organizador-agenda -f status=running)" ]; then
+              echo "ERRO: container não está rodando após o deploy"
+              docker logs --tail 30 organizador-agenda || true
+              exit 1
+            fi
+            echo "Container no ar com $commit_alvo"
+            docker logs --tail 5 organizador-agenda
