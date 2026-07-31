@@ -35,6 +35,22 @@ Na dúvida, **confirme que o deploy rodou depois do merge** em vez de supor:
 gh run list --workflow=deploy.yml --limit 1
 ```
 
+## "Success" não garante que o código subiu
+
+Em 2026-07-30 descobrimos que a produção estava **6 dias parada** enquanto três deploys seguidos reportavam `success`. O `git pull` na VM abortava (`Your local changes would be overwritten`) porque o `deploy.sh` tinha sido editado lá, e o script continuava: o `docker build` reaproveitava o cache e recriava o container com o **código antigo**.
+
+O script agora usa `set -euo pipefail` + `git fetch && git reset --hard origin/main` e verifica se o container ficou de pé. Mas a lição vale para qualquer suspeita de "corrigi e continua errado":
+
+```bash
+gh run view <run-id> --log | grep -iE "Updating|Fast-forward|error:|Aborting|COPY src"
+```
+
+- `Fast-forward` ou `Updating a..b` sem erro = código novo entrou
+- `Aborting` = **não entrou**, mesmo com o job verde
+- `COPY src/ src/ ---> Using cache` = o código-fonte não mudou nessa build
+
+Se o usuário disser que a correção não surtiu efeito, **cheque isto antes de duvidar do código**.
+
 Ligar o modo automático: `docs/setup_pat.md`.
 
 ## Fluxo completo
