@@ -276,47 +276,96 @@ class TestCheckCoupleConflicts:
     def _sent_text(self, app) -> str:
         return app.bot.send_message.await_args.kwargs["text"]
 
-    def test_does_not_flag_same_event_seen_in_both_calendars(self):
+    def _compartilhado(self, event: dict, dono: str) -> dict:
+        """O mesmo evento como o parceiro o enxerga: vindo da agenda do dono."""
+        copia = dict(event)
+        copia["_calendar_name"] = dono
+        return copia
+
+    def test_nao_acusa_o_mesmo_evento_visto_nas_duas_agendas(self):
         event = self._event("evt1", "Consulta", 14)
         app = self._run({"matheus": [event], "cecilia": [event]})
         assert app.bot.send_message.await_count == 0
 
-    def test_does_not_flag_identical_event_with_different_ids(self):
-        # Cópias do mesmo compromisso podem ter ids diferentes; título e
-        # horário iguais bastam para tratar como o mesmo evento.
+    def test_nao_acusa_copias_do_mesmo_compromisso(self):
+        # Cada um criou o compromisso na própria agenda: são duas cópias,
+        # mas ninguém precisa estar em dois lugares.
         app = self._run({
             "matheus": [self._event("evt-a", "Consulta", 14)],
             "cecilia": [self._event("evt-b", "Consulta", 14)],
         })
         assert app.bot.send_message.await_count == 0
 
-    def test_does_not_flag_events_from_familia_calendar(self):
+    def test_nao_acusa_quando_cada_um_tem_o_seu_compromisso(self):
+        # Caso relatado: Caponga (agenda do Matheus) x aniversário (agenda da
+        # Cecília). Horários se sobrepõem, mas cada um vai ao seu.
+        caponga = self._event("cap", "Caponga", 14)
+        aniversario = self._event("ani", "Aniversário da Raiane", 14)
         app = self._run({
-            "matheus": [self._event("evt-fam", "Almoço", 12, calendar_name="Família")],
-            "cecilia": [self._event("evt-x", "Reunião", 12)],
+            "matheus": [caponga, self._compartilhado(aniversario, "Cecilia")],
+            "cecilia": [aniversario, self._compartilhado(caponga, "Matheus")],
         })
         assert app.bot.send_message.await_count == 0
 
-    def test_flags_genuine_conflict_between_different_events(self):
+    def test_acusa_dois_compromissos_da_mesma_pessoa(self):
+        # Ninguém está em dois lugares ao mesmo tempo.
+        dentista = self._event("den", "Dentista", 14)
+        reuniao = self._event("reu", "Reunião", 14)
         app = self._run({
-            "matheus": [self._event("evt-a", "Dentista", 14)],
-            "cecilia": [self._event("evt-b", "Reunião", 14)],
+            "matheus": [dentista, reuniao],
+            "cecilia": [
+                self._compartilhado(dentista, "Matheus"),
+                self._compartilhado(reuniao, "Matheus"),
+            ],
         })
         assert app.bot.send_message.await_count == 2
-        text = self._sent_text(app)
-        assert "Dentista" in text
-        assert "Reunião" in text
+        texto = self._sent_text(app)
+        assert "matheus" in texto
+        assert "Dentista" in texto
+        assert "Reunião" in texto
 
-    def test_reports_mirrored_conflict_only_once(self):
-        # Com agendas compartilhadas as duas listas trazem os dois eventos.
-        dentista = self._event("evt-a", "Dentista", 14)
-        reuniao = self._event("evt-b", "Reunião", 14)
+    def test_acusa_compromisso_conjunto_contra_individual(self):
+        # Alguém vai ter que faltar ao compromisso do casal.
+        almoco = self._event("fam", "Almoço em família", 12, calendar_name="Família")
+        reuniao = self._event("reu", "Reunião", 12)
+        app = self._run({
+            "matheus": [almoco, reuniao],
+            "cecilia": [almoco, self._compartilhado(reuniao, "Matheus")],
+        })
+        assert app.bot.send_message.await_count == 2
+        texto = self._sent_text(app)
+        assert "matheus" in texto
+        assert "Almoço em família" in texto
+
+    def test_nao_acusa_conjunto_contra_compromisso_do_outro_fora_do_horario(self):
+        almoco = self._event("fam", "Almoço em família", 12, calendar_name="Família")
+        tarde = self._event("tar", "Reunião", 18)
+        app = self._run({
+            "matheus": [almoco, tarde],
+            "cecilia": [almoco, self._compartilhado(tarde, "Matheus")],
+        })
+        assert app.bot.send_message.await_count == 0
+
+    def test_relata_o_par_uma_vez_so(self):
+        dentista = self._event("den", "Dentista", 14)
+        reuniao = self._event("reu", "Reunião", 14)
         app = self._run({
             "matheus": [dentista, reuniao],
             "cecilia": [dentista, reuniao],
         })
-        text = self._sent_text(app)
-        assert text.count("Dentista") == 1
+        texto = self._sent_text(app)
+        assert texto.count("Dentista") == 1
+
+    def test_mostra_a_janela_de_sobreposicao(self):
+        # A mensagem antiga misturava a data do dia analisado com o horário de
+        # início do evento, o que não fazia sentido para quem lia.
+        dentista = self._event("den", "Dentista", 14)
+        reuniao = self._event("reu", "Reunião", 14)
+        reuniao["start"] = {"dateTime": datetime(2026, 7, 14, 14, 30, tzinfo=FORTALEZA).isoformat()}
+        app = self._run({"matheus": [dentista, reuniao], "cecilia": []})
+
+        texto = self._sent_text(app)
+        assert "14:30 às 15:00" in texto
 
 
 AGORA = datetime(2026, 7, 24, 9, 0, tzinfo=FORTALEZA)

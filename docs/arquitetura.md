@@ -100,18 +100,33 @@ O ponto que mais confunde neste projeto.
 **As agendas dos dois são compartilhadas entre si.** `list_all_calendars()` devolve todas as agendas às quais o usuário tem acesso, então `get_events_for_date()` retorna praticamente **a mesma lista para os dois**. Consequências:
 
 - Um evento criado por um aparece nos resumos e lembretes do outro **sem precisar estar em nenhuma agenda especial**.
-- A detecção de conflito comparava cada evento **com ele mesmo** e acusava conflito havendo um único compromisso. Com 2 eventos reais, chegava a reportar 4 conflitos.
+- A lista devolvida para um usuário **não diz de quem é** cada evento. Tratar `get_events_for_date("matheus")` como "eventos do Matheus" é o erro que gerou duas rodadas de bug em conflitos.
 
-Regras atuais em `check_couple_conflicts`:
+### Quem é o dono de um evento
+
+A pista está em `_calendar_name`, que `_fetch_events_from_all_calendars` só preenche para agendas **não primárias**:
+
+| Como o evento aparece na lista de X | Significa |
+|---|---|
+| Sem `_calendar_name` | Está na agenda principal de X — é compromisso **de X** |
+| `_calendar_name` = agenda conjunta (`Família`) | Compromisso **dos dois** |
+| `_calendar_name` = outra agenda | Veio da agenda do parceiro ou de terceiro — dono indefinido, ignorado |
+
+### Detecção de conflito
+
+O modelo é: **cada evento prende um conjunto de pessoas**, e há conflito quando dois eventos sobrepostos prendem **alguém em comum** (`_commitment_map` + `_find_conflicts`).
 
 | Situação | Vira conflito? |
 |---|---|
-| Mesmo evento nas duas listas (mesmo `id`, `iCalUID` ou título+horário) | Não |
-| Evento da agenda `Família` (`SHARED_COUPLE_CALENDARS`) | Não — compromisso comum |
-| Par já reportado, espelhado (A×B e B×A) | Só uma vez |
-| Eventos diferentes com horários sobrepostos | **Sim** |
+| Dois compromissos da mesma pessoa | **Sim** — ninguém está em dois lugares |
+| Compromisso conjunto × individual de um deles | **Sim** — alguém vai faltar ao conjunto |
+| Cada um com o seu compromisso | Não — não há disputa |
+| Mesmo evento visto nas duas agendas | Não — é um evento só (deduplicado por `id`) |
+| Par já reportado em outro dia | Só uma vez |
 
-A agenda `Família` sai só da checagem de conflito — seus eventos continuam aparecendo normalmente em resumos e lembretes.
+A mensagem informa **quem** fica preso e a **janela de sobreposição**, não o horário de início solto: `• 31/07 15:00 às 16:00 — matheus: Dentista × Reunião`.
+
+> Compromisso de agenda secundária (ex.: uma agenda "Trabalho" só do Matheus) não entra na checagem, porque não dá para atribuir dono com segurança. A escolha é conservadora de propósito: erra para menos ruído.
 
 ## Testes
 
