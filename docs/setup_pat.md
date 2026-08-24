@@ -8,15 +8,31 @@ Guia para ligar o deploy automático e a exclusão automática de branch. Leva ~
 |---|---|---|
 | 24/08/2026 | **22/11/2026** | 90 dias |
 
-A expiração não dá erro visível. O `auto-merge.yml` cai no `GITHUB_TOKEN`, o job
-fica verde, e o sintoma é indireto: o deploy não roda sozinho e a branch não é
-apagada. Se notar isso, suspeite do token antes de procurar bug no workflow.
-
 Para renovar, gere outro token com as permissões da seção abaixo e rode:
 
 ```bash
 gh secret set AUTO_MERGE_PAT
 ```
+
+### Dois modos de falha, sintomas opostos
+
+Vale distinguir, porque o diagnóstico muda:
+
+| Situação | O que acontece | Sintoma |
+|---|---|---|
+| Secret **ausente** ou vazio | A expressão `secrets.AUTO_MERGE_PAT \|\| secrets.GITHUB_TOKEN` cai no `GITHUB_TOKEN` | Job **verde**. Deploy não dispara e a branch não é apagada |
+| Secret **presente**, token expirado ou sem permissão | Um token expirado ainda é uma string não vazia, então a expressão o escolhe. A API recusa a chamada | Job `auto-merge` **vermelho** no PR |
+
+Ou seja: se o auto-merge falhou, olhe o token. Se ele passou mas o deploy não
+rodou e a branch ficou, olhe se o secret existe.
+
+Para saber qual token mergeou um PR, veja quem ativou o auto-merge:
+
+```bash
+gh pr view <n> --json autoMergeRequest -q .autoMergeRequest.enabledBy.login
+```
+
+Seu usuário = o PAT funcionou. `github-actions[bot]` = caiu no `GITHUB_TOKEN`.
 
 ## Por que isso é necessário
 
@@ -37,7 +53,7 @@ Usando um **PAT** (Personal Access Token — token pessoal seu), o merge passa a
 
 1. Acesse **https://github.com/settings/personal-access-tokens/new** (Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token)
 2. **Token name:** `organizador-agenda-automerge`
-3. **Expiration:** escolha o prazo (ex.: 1 ano). ⚠️ Anote a data — quando expirar, o auto-merge volta a se comportar como hoje e será preciso gerar outro.
+3. **Expiration:** escolha o prazo (ex.: 1 ano). ⚠️ Anote a data na seção "Validade do token atual" no topo deste arquivo — quando expirar, o job `auto-merge` passa a falhar nos PRs até você gerar outro.
 4. **Repository access:** marque `Only select repositories` e escolha **`organizador_agenda`**
 5. Em **Repository permissions**, ajuste apenas estas duas:
    - **Contents** → `Read and write`
