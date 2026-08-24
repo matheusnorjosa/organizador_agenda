@@ -2,6 +2,22 @@
 
 Guia para ligar o deploy automático e a exclusão automática de branch. Leva ~3 minutos.
 
+## Validade do token atual
+
+| Renovado em | Expira em | Prazo escolhido |
+|---|---|---|
+| 24/08/2026 | **22/11/2026** | 90 dias |
+
+A expiração não dá erro visível. O `auto-merge.yml` cai no `GITHUB_TOKEN`, o job
+fica verde, e o sintoma é indireto: o deploy não roda sozinho e a branch não é
+apagada. Se notar isso, suspeite do token antes de procurar bug no workflow.
+
+Para renovar, gere outro token com as permissões da seção abaixo e rode:
+
+```bash
+gh secret set AUTO_MERGE_PAT
+```
+
 ## Por que isso é necessário
 
 O auto-merge usa o `GITHUB_TOKEN`, um token temporário que o próprio GitHub Actions cria. Por segurança, o GitHub **não encadeia workflows a partir de ações feitas com esse token** — é uma proteção contra loops infinitos (um workflow que dispara outro que dispara o primeiro...).
