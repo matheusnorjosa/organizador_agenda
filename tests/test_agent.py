@@ -337,6 +337,20 @@ class TestCheckCoupleConflicts:
         assert "matheus" in texto
         assert "Almoço em família" in texto
 
+    def test_acusa_conjunto_mesmo_quando_um_dos_dois_ocultou_familia(self):
+        # Ocultar a agenda no /agendas não desfaz o compromisso: o evento
+        # chega pela lista do outro e continua prendendo os dois.
+        almoco = self._event("fam", "Almoço em família", 12, calendar_name="Família")
+        reuniao = self._event("reu", "Reunião", 12)
+        app = self._run({
+            "matheus": [reuniao],
+            "cecilia": [almoco, self._compartilhado(reuniao, "Matheus")],
+        })
+        assert app.bot.send_message.await_count == 2
+        texto = self._sent_text(app)
+        assert "matheus" in texto
+        assert "Almoço em família" in texto
+
     def test_nao_acusa_conjunto_contra_compromisso_do_outro_fora_do_horario(self):
         almoco = self._event("fam", "Almoço em família", 12, calendar_name="Família")
         tarde = self._event("tar", "Reunião", 18)

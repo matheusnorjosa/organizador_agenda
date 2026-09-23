@@ -14,6 +14,7 @@ from src.calendar_api import (
     _fetch_events_from_all_calendars,
     _get_period,
     _calendar_tag,
+    set_calendar_hidden,
     RECURRENCE_MAP,
 )
 
@@ -267,6 +268,77 @@ class TestFetchEventsTimezone:
 
         _, kwargs = mock_service.events.return_value.list.call_args
         assert kwargs["timeZone"] == "America/Sao_Paulo"
+
+
+class TestAgendasOcultas:
+    PRINCIPAL = "matheus@gmail.com"
+    FERIADOS = "pt-br.brazilian#holiday@group.v.calendar.google.com"
+
+    CALENDARS = [
+        {"id": PRINCIPAL, "name": "Matheus", "access": "owner", "primary": True},
+        {"id": FERIADOS, "name": "Feriados no Brasil", "access": "reader", "primary": False},
+    ]
+    EVENTS_BY_CALENDAR = {
+        PRINCIPAL: [{"id": "dentista", "summary": "Dentista",
+                     "start": {"dateTime": "2026-09-24T10:00:00-03:00"}}],
+        FERIADOS: [{"id": "feriado", "summary": "Feriado",
+                    "start": {"date": "2026-09-24"}}],
+    }
+
+    def _fetch_summaries(self, user_id: str, hidden_path: str) -> list[str]:
+        def list_events(calendarId, **_kwargs):
+            request = MagicMock()
+            items = [dict(event) for event in self.EVENTS_BY_CALENDAR[calendarId]]
+            request.execute.return_value = {"items": items}
+            return request
+
+        service = MagicMock()
+        service.events.return_value.list.side_effect = list_events
+
+        with patch("src.calendar_api.HIDDEN_CALENDARS_PATH", hidden_path), \
+             patch("src.calendar_api.get_calendar_service", return_value=service), \
+             patch("src.calendar_api.list_all_calendars", return_value=self.CALENDARS):
+            events = _fetch_events_from_all_calendars(
+                user_id, "2026-09-24T00:00:00-03:00", "2026-09-24T23:59:59-03:00"
+            )
+        return sorted(event["summary"] for event in events)
+
+    def test_sem_escolha_salva_mostra_todas_as_agendas(self, tmp_path):
+        # Estado de quem nunca usou o /agendas, inclusive logo após o deploy.
+        hidden_path = str(tmp_path / "estado" / "agendas_ocultas.json")
+        assert self._fetch_summaries("matheus", hidden_path) == ["Dentista", "Feriado"]
+
+    def test_evento_de_agenda_oculta_nao_aparece(self, tmp_path):
+        hidden_path = str(tmp_path / "estado" / "agendas_ocultas.json")
+        with patch("src.calendar_api.HIDDEN_CALENDARS_PATH", hidden_path):
+            set_calendar_hidden("matheus", self.FERIADOS, hidden=True)
+
+        assert self._fetch_summaries("matheus", hidden_path) == ["Dentista"]
+
+    def test_ocultar_vale_so_para_quem_ocultou(self, tmp_path):
+        # As agendas são compartilhadas: a escolha de um não pode sumir com
+        # os eventos do outro.
+        hidden_path = str(tmp_path / "estado" / "agendas_ocultas.json")
+        with patch("src.calendar_api.HIDDEN_CALENDARS_PATH", hidden_path):
+            set_calendar_hidden("matheus", self.FERIADOS, hidden=True)
+
+        assert self._fetch_summaries("cecilia", hidden_path) == ["Dentista", "Feriado"]
+
+    def test_mostrar_de_novo_traz_os_eventos_de_volta(self, tmp_path):
+        hidden_path = str(tmp_path / "estado" / "agendas_ocultas.json")
+        with patch("src.calendar_api.HIDDEN_CALENDARS_PATH", hidden_path):
+            set_calendar_hidden("matheus", self.FERIADOS, hidden=True)
+            set_calendar_hidden("matheus", self.FERIADOS, hidden=False)
+
+        assert self._fetch_summaries("matheus", hidden_path) == ["Dentista", "Feriado"]
+
+    def test_arquivo_ilegivel_nao_derruba_a_busca(self, tmp_path):
+        # Lembretes e resumos dependem dessa busca; melhor mostrar agenda a
+        # mais do que parar de avisar.
+        hidden_file = tmp_path / "agendas_ocultas.json"
+        hidden_file.write_text("{isso não é json", encoding="utf-8")
+
+        assert self._fetch_summaries("matheus", str(hidden_file)) == ["Dentista", "Feriado"]
 
 
 class TestEventosDeVariosDias:

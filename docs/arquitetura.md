@@ -128,6 +128,19 @@ A mensagem informa **quem** fica preso e a **janela de sobreposição**, não o 
 
 > Compromisso de agenda secundária (ex.: uma agenda "Trabalho" só do Matheus) não entra na checagem, porque não dá para atribuir dono com segurança. A escolha é conservadora de propósito: erra para menos ruído.
 
+### Agendas ocultas (`/agendas`)
+
+Cada pessoa pode esconder do bot uma agenda que não quer ver (ex.: `Feriados no Brasil`). Nada muda no Google Agenda.
+
+- **Vale só para quem ocultou.** As agendas são compartilhadas, então a escolha de um não pode sumir com os eventos do outro.
+- **O filtro fica num ponto só:** `_fetch_events_from_all_calendars`. Por ali passam os comandos, os lembretes, os resumos, o aviso de compromisso novo e os conflitos.
+- **A agenda principal não tem botão.** Sem ela somem os compromissos da própria pessoa, e o conflito perde a pista de dono (evento sem `_calendar_name`).
+- **Ocultar `Família` de um só não tira os conflitos com ela.** O evento continua chegando pela lista do outro e prende os dois.
+- **Estado em `estado/agendas_ocultas.json`**, por nome de usuário. Arquivo ilegível vira "nada oculto", com log de erro: melhor mostrar agenda a mais do que parar os avisos.
+- **O botão leva um resumo do ID, não o ID.** O Telegram limita o dado do botão a 64 bytes, e o ID das agendas novas do Google passa disso.
+
+Agenda oculta no próprio Google ("Ocultar da lista") também some do bot, porque a API não devolve agendas ocultas por padrão.
+
 ## Testes
 
 `pytest`, sem rede: as chamadas ao Google e ao Telegram são mockadas.
