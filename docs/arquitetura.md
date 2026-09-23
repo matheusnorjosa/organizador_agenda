@@ -141,6 +141,21 @@ Cada pessoa pode esconder do bot uma agenda que não quer ver (ex.: `Feriados no
 
 Agenda oculta no próprio Google ("Ocultar na lista") também some do bot, porque a API não devolve agendas ocultas por padrão.
 
+### Remover agenda da conta Google (`/remover_agenda`)
+
+Ao contrário do `/agendas`, este comando muda o Google Agenda da pessoa. O bot mostra as consequências e só age depois da confirmação.
+
+| Situação | O que o bot faz | Chamada |
+|---|---|---|
+| Agenda de outra pessoa ou inscrita (ex.: `Feriados`) | Tira da lista de quem pediu; os eventos continuam para os outros | `calendarList.delete` |
+| Agenda da qual a pessoa é **dona de fato** | Exclui a agenda e os eventos, para todo mundo. O aviso lista quem mais perde | `calendars.delete` |
+| Agenda principal | Não aparece no menu | — |
+
+- **"Dona de fato" vem do `dataOwner`, não da permissão.** Quem recebe uma agenda com "gerenciar compartilhamento" também tem permissão `owner`, e decidir por ela excluiria a agenda de outra pessoa. Sem `dataOwner`, o bot só tira da lista.
+- **A cada toque o bot relê a agenda no Google**, porque o botão pode ser de uma mensagem antiga. O botão de confirmar leva a ação avisada (`sair` ou `excluir`). Se a ação calculada na hora for outra, nada é feito.
+- **Sair da `Família` não tira os conflitos com ela**, pelo mesmo motivo do `/agendas`: os eventos continuam chegando pela lista do outro.
+- Ao remover, a escolha do `/agendas` para aquela agenda é apagada, para ela não voltar escondida se for adicionada de novo.
+
 ## Testes
 
 `pytest`, sem rede: as chamadas ao Google e ao Telegram são mockadas.

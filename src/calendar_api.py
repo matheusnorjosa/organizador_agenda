@@ -254,6 +254,65 @@ def set_calendar_hidden(user_id: str, calendar_id: str, hidden: bool):
         json.dump(hidden_by_user, state_file, indent=2, ensure_ascii=False)
 
 
+# --- Remover agenda da conta Google (/remover_agenda) ---
+
+# Vão no botão de confirmação: o bot confere que vai fazer o que foi avisado.
+REMOVAL_LEAVE = "sair"
+REMOVAL_DELETE = "excluir"
+
+
+def calendar_removal_action(user_id: str, calendar: dict, my_email: str) -> str:
+    """Só exclui quando o Google confirma que a pessoa é a dona de fato.
+
+    Quem recebe uma agenda com "gerenciar compartilhamento" também tem
+    permissão de dono. Decidir pela permissão excluiria a agenda de outra
+    pessoa, para todo mundo.
+    """
+    if calendar["access"] != "owner":
+        return REMOVAL_LEAVE
+
+    service = get_calendar_service(user_id)
+    details = service.calendars().get(calendarId=calendar["id"]).execute()
+    data_owner = details.get("dataOwner")
+    if data_owner and data_owner.lower() == my_email.lower():
+        return REMOVAL_DELETE
+    return REMOVAL_LEAVE
+
+
+def calendar_shared_with(user_id: str, calendar_id: str, my_email: str) -> list[str] | None:
+    """Quem mais perde a agenda se ela for excluída; None se o Google não disser."""
+    try:
+        service = get_calendar_service(user_id)
+        rules = service.acl().list(calendarId=calendar_id).execute().get("items", [])
+    except Exception as e:
+        logger.warning(f"Não foi possível ler o compartilhamento da agenda {calendar_id}: {e}")
+        return None
+
+    people = []
+    for rule in rules:
+        scope = rule.get("scope", {})
+        if scope.get("type") == "default":
+            people.append("qualquer pessoa (a agenda é pública)")
+            continue
+        who = scope.get("value", "")
+        # Agenda secundária costuma listar o próprio ID como dono; não é gente.
+        if who and who.lower() not in (my_email.lower(), calendar_id.lower()):
+            people.append(who)
+    return people
+
+
+def unsubscribe_calendar(user_id: str, calendar_id: str):
+    """Tira a agenda da lista da pessoa. Os eventos continuam para os outros."""
+    service = get_calendar_service(user_id)
+    service.calendarList().delete(calendarId=calendar_id).execute()
+
+
+def delete_calendar(user_id: str, calendar_id: str):
+    """Exclui a agenda e todos os eventos dela, para todo mundo. Não tem volta."""
+    service = get_calendar_service(user_id)
+    service.calendars().delete(calendarId=calendar_id).execute()
+
+
 def _fetch_events_from_all_calendars(
     user_id: str, time_min: str, time_max: str,
 ) -> list[dict]:

@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta
+from typing import NamedTuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -32,6 +33,12 @@ from src.calendar_api import (
     list_all_calendars,
     get_hidden_calendars,
     set_calendar_hidden,
+    calendar_removal_action,
+    calendar_shared_with,
+    unsubscribe_calendar,
+    delete_calendar,
+    REMOVAL_DELETE,
+    REMOVAL_LEAVE,
     is_user_authenticated,
     generate_auth_url,
     complete_auth,
@@ -165,6 +172,7 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Agenda:*\n"
         "/auth — Cadastra e conecta sua conta Google\n"
         "/agendas — Escolhe quais agendas aparecem no bot\n"
+        "/remover\\_agenda — Remove uma agenda da sua conta Google\n"
         "/hoje — Eventos de hoje\n"
         "/amanha — Eventos de amanhã\n"
         "/eventos — Próximos 7 dias\n"
@@ -1235,11 +1243,15 @@ AGENDAS_TEXT = (
 )
 
 
-def _calendar_button_data(calendar_id: str) -> str:
+def _calendar_key(calendar_id: str) -> str:
     # O Telegram aceita no máximo 64 bytes por botão, e o ID das agendas
     # criadas hoje no Google passa disso. O resumo do ID cabe e continua
     # valendo depois de um reinício do bot.
-    return "agenda:" + hashlib.sha256(calendar_id.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(calendar_id.encode("utf-8")).hexdigest()[:16]
+
+
+def _find_calendar(calendars: list[dict], key: str) -> dict | None:
+    return next((cal for cal in calendars if _calendar_key(cal["id"]) == key), None)
 
 
 def _calendar_visibility_keyboard(calendars: list[dict], hidden: set[str]) -> InlineKeyboardMarkup:
@@ -1254,7 +1266,7 @@ def _calendar_visibility_keyboard(calendars: list[dict], hidden: set[str]) -> In
         else:
             label = f"✅ {cal['name']}"
         buttons.append(
-            [InlineKeyboardButton(label, callback_data=_calendar_button_data(cal["id"]))]
+            [InlineKeyboardButton(label, callback_data=f"agenda:{_calendar_key(cal['id'])}")]
         )
     return InlineKeyboardMarkup(buttons)
 
@@ -1300,10 +1312,7 @@ async def callback_toggle_calendar(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("Erro ao acessar suas agendas. Tente novamente.")
         return
 
-    calendar = next(
-        (cal for cal in calendars if _calendar_button_data(cal["id"]) == query.data),
-        None,
-    )
+    calendar = _find_calendar(calendars, query.data.replace("agenda:", "", 1))
     if calendar is None:
         await query.edit_message_text(
             "Essa agenda não está mais na sua conta Google. Use /agendas de novo."
@@ -1324,6 +1333,196 @@ async def callback_toggle_calendar(update: Update, context: ContextTypes.DEFAULT
     await query.edit_message_reply_markup(
         reply_markup=_calendar_visibility_keyboard(calendars, get_hidden_calendars(user_id))
     )
+
+
+# --- /remover_agenda ---
+
+REMOVE_CALENDAR_TEXT = (
+    "🗑️ Remover uma agenda da sua conta Google\n\n"
+    "Isto muda o seu Google Agenda, não só o bot. Antes de remover, eu mostro "
+    "o que vai acontecer e peço confirmação.\n\n"
+    "Para só parar de ver os eventos aqui, use /agendas: um toque desfaz.\n\n"
+    "Qual agenda?"
+)
+
+
+class _RemovalTarget(NamedTuple):
+    user_id: str
+    calendar: dict
+    action: str
+    my_email: str
+
+
+def _removable_calendars(calendars: list[dict]) -> list[dict]:
+    # A principal é a própria conta Google; o Google não deixa removê-la.
+    return [cal for cal in calendars if not cal["primary"]]
+
+
+def _my_email(calendars: list[dict]) -> str:
+    # O ID da agenda principal é o e-mail da conta.
+    return next((cal["id"] for cal in calendars if cal["primary"]), "")
+
+
+def _removal_warning(name: str, action: str, shared_with: list[str] | None) -> tuple[str, str]:
+    """Texto do aviso e rótulo do botão que confirma."""
+    if action == REMOVAL_LEAVE:
+        text = (
+            f'⚠️ Remover "{name}" da sua conta Google?\n\n'
+            "• Ela some do seu Google Agenda, no celular e no computador, e daqui do bot.\n"
+            "• Os eventos não são apagados: continuam para o dono e para quem mais tem acesso.\n"
+            "• Para voltar, ela precisa ser adicionada de novo no Google. Se alguém "
+            "compartilhou com você, essa pessoa precisa compartilhar outra vez."
+        )
+        return text, "Sim, remover da minha conta"
+
+    if shared_with is None:
+        who = "• Ela some para todo mundo que tem acesso."
+    elif shared_with:
+        who = "• Ela some também para: " + ", ".join(shared_with)
+    else:
+        who = "• Ninguém mais tem acesso a ela."
+    text = (
+        f'🚨 Excluir a agenda "{name}" para sempre?\n\n'
+        "Você é dono(a) desta agenda. Para agenda própria, o Google não tem a "
+        "opção de só sair: a única forma de remover é excluir.\n\n"
+        "• A agenda e todos os eventos dela, passados e futuros, são apagados.\n"
+        f"{who}\n"
+        "• Não dá para desfazer, nem pelo Google."
+    )
+    return text, "🗑️ Sim, excluir para todos"
+
+
+async def _load_removal_target(query, key: str) -> _RemovalTarget | None:
+    """Relê a agenda no Google a cada passo, porque o botão pode ser antigo.
+
+    Devolve None quando já respondeu ao usuário.
+    """
+    user_id = get_user_id(query.from_user.id)
+    if not user_id:
+        await query.edit_message_text("Erro: usuário não encontrado.")
+        return None
+
+    try:
+        calendars = list_all_calendars(user_id)
+        calendar = _find_calendar(_removable_calendars(calendars), key)
+        target = None
+        if calendar:
+            my_email = _my_email(calendars)
+            action = calendar_removal_action(user_id, calendar, my_email)
+            target = _RemovalTarget(user_id, calendar, action, my_email)
+    except Exception as e:
+        logger.error(f"Erro ao consultar agenda para remover ({user_id}): {e}")
+        await query.edit_message_text("Não consegui consultar essa agenda no Google. Nada foi removido.")
+        return None
+
+    if target is None:
+        await query.edit_message_text(
+            "Essa agenda não está mais na sua conta Google. Use /remover_agenda de novo."
+        )
+    return target
+
+
+async def cmd_remover_agenda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = await check_user(update)
+    if not user_id:
+        return
+
+    try:
+        calendars = list_all_calendars(user_id)
+    except Exception as e:
+        logger.error(f"Erro ao listar agendas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar suas agendas. Tente novamente.")
+        return
+
+    removable = _removable_calendars(calendars)
+    if not removable:
+        await update.message.reply_text(
+            "Você só tem a agenda principal, e ela não pode ser removida."
+        )
+        return
+
+    buttons = [
+        [InlineKeyboardButton(cal["name"], callback_data=f"rmagenda:{_calendar_key(cal['id'])}")]
+        for cal in removable
+    ]
+    buttons.append([InlineKeyboardButton("Cancelar", callback_data="rmagenda_cancel")])
+    await update.message.reply_text(REMOVE_CALENDAR_TEXT, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def callback_warn_calendar_removal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    key = query.data.replace("rmagenda:", "", 1)
+    target = await _load_removal_target(query, key)
+    if target is None:
+        return
+
+    shared_with = None
+    if target.action == REMOVAL_DELETE:
+        shared_with = calendar_shared_with(target.user_id, target.calendar["id"], target.my_email)
+
+    text, confirm_label = _removal_warning(target.calendar["name"], target.action, shared_with)
+    buttons = [[
+        InlineKeyboardButton(confirm_label, callback_data=f"rmagenda_ok:{target.action}:{key}"),
+        InlineKeyboardButton("Cancelar", callback_data="rmagenda_cancel"),
+    ]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def callback_confirm_calendar_removal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # partition não falha com dado malformado: chave vazia cai em "não encontrada".
+    confirmed_action, _separator, key = query.data.replace("rmagenda_ok:", "", 1).partition(":")
+    target = await _load_removal_target(query, key)
+    if target is None:
+        return
+
+    name = target.calendar["name"]
+    if target.action != confirmed_action:
+        # O aviso que a pessoa confirmou descrevia outra consequência.
+        await query.edit_message_text(
+            f'A situação de "{name}" mudou desde o aviso. Nada foi removido. '
+            "Use /remover_agenda de novo para ver o aviso atualizado."
+        )
+        return
+
+    try:
+        if target.action == REMOVAL_DELETE:
+            delete_calendar(target.user_id, target.calendar["id"])
+        else:
+            unsubscribe_calendar(target.user_id, target.calendar["id"])
+    except Exception as e:
+        logger.error(f"Erro ao remover a agenda {name} de {target.user_id}: {e}")
+        await query.edit_message_text(
+            f'❌ Não consegui remover "{name}": o Google devolveu um erro. '
+            "Confira no Google Agenda antes de tentar de novo."
+        )
+        return
+
+    logger.info(
+        f"{target.user_id} removeu a agenda {name} ({target.calendar['id']}): {target.action}"
+    )
+
+    # Se ela for adicionada de novo, não deve voltar escondida por escolha antiga.
+    try:
+        if target.calendar["id"] in get_hidden_calendars(target.user_id):
+            set_calendar_hidden(target.user_id, target.calendar["id"], hidden=False)
+    except OSError as e:
+        logger.error(f"Erro ao limpar agenda oculta de {target.user_id}: {e}")
+
+    if target.action == REMOVAL_DELETE:
+        await query.edit_message_text(f'✅ A agenda "{name}" foi excluída.')
+    else:
+        await query.edit_message_text(f'✅ "{name}" foi removida da sua conta Google.')
+
+
+async def callback_cancel_calendar_removal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Cancelado. Nenhuma agenda foi removida.")
 
 
 # --- Handler de texto livre (linguagem natural) ---
@@ -1657,6 +1856,7 @@ def create_bot(token: str) -> Application:
     app.add_handler(CommandHandler("silencio", cmd_silencio))
     app.add_handler(CommandHandler("ativar", cmd_ativar))
     app.add_handler(CommandHandler("agendas", cmd_agendas))
+    app.add_handler(CommandHandler("remover_agenda", cmd_remover_agenda))
     app.add_handler(CallbackQueryHandler(callback_select_calendar, pattern=r"^cal:"))
     app.add_handler(CallbackQueryHandler(callback_confirm_delete_event, pattern=r"^confirmdel:"))
     app.add_handler(CallbackQueryHandler(callback_delete_event, pattern=r"^del:"))
@@ -1668,6 +1868,9 @@ def create_bot(token: str) -> Application:
     app.add_handler(CallbackQueryHandler(callback_confirm_delete_task, pattern=r"^confirmdeltask:"))
     app.add_handler(CallbackQueryHandler(callback_delete_task, pattern=r"^deltask:"))
     app.add_handler(CallbackQueryHandler(callback_toggle_calendar, pattern=r"^agenda:"))
+    app.add_handler(CallbackQueryHandler(callback_warn_calendar_removal, pattern=r"^rmagenda:"))
+    app.add_handler(CallbackQueryHandler(callback_confirm_calendar_removal, pattern=r"^rmagenda_ok:"))
+    app.add_handler(CallbackQueryHandler(callback_cancel_calendar_removal, pattern=r"^rmagenda_cancel$"))
     # Handler de texto livre: edição + linguagem natural
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))
 
