@@ -411,7 +411,7 @@ async def cmd_criar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     buttons = [
-        [InlineKeyboardButton(cal["name"], callback_data=f"cal:{cal['id']}")]
+        [InlineKeyboardButton(cal["name"], callback_data=f"cal:{_calendar_key(cal['id'])}")]
         for cal in calendars
     ]
     keyboard = InlineKeyboardMarkup(buttons)
@@ -433,15 +433,24 @@ async def callback_select_calendar(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("Erro: usuário não encontrado.")
         return
 
-    calendar_id = query.data.replace("cal:", "", 1)
     pending = context.user_data.get("pending_event")
 
     if not pending:
         await query.edit_message_text("Erro: nenhum evento pendente. Use /criar novamente.")
         return
 
+    try:
+        calendar = _find_calendar(list_calendars(user_id), query.data.replace("cal:", "", 1))
+    except Exception as e:
+        logger.error(f"Erro ao listar agendas de {user_id}: {e}")
+        await query.edit_message_text("Erro ao acessar suas agendas. Tente novamente.")
+        return
+    if calendar is None:
+        await query.edit_message_text("Essa agenda não está mais disponível. Use /criar novamente.")
+        return
+
     await create_event_in_calendar(
-        update, context, user_id, calendar_id,
+        update, context, user_id, calendar["id"],
         pending["title"], pending["date"], pending["time"],
         recurrence=pending.get("recurrence"),
         edit_message=query,
@@ -472,6 +481,84 @@ async def create_event_in_calendar(
         await update.message.reply_text(text)
 
 
+# --- Menus de evento (/editar, /excluir) ---
+
+MENU_EXPIRED_TEXT = "Esse menu expirou. Use o comando de novo."
+
+
+def _can_delete(event: dict) -> bool:
+    return event.get("_calendar_access") in ("owner", "writer")
+
+
+def _can_edit(event: dict) -> bool:
+    # Em convite de outra pessoa, só quem organiza muda título e horário.
+    organizer_here = event.get("organizer", {}).get("self", False)
+    return _can_delete(event) and (organizer_here or event.get("guestsCanModify", False))
+
+
+def _event_label(event: dict) -> str:
+    summary = event.get("summary", "Sem título")
+    # O mesmo compromisso pode vir de duas agendas (o original e a cópia do
+    # convite); sem o nome da agenda, os dois botões ficariam iguais.
+    if event.get("_calendar_name"):
+        summary += f" [{event['_calendar_name']}]"
+    start = event["start"]
+    if "dateTime" in start:
+        dt = datetime.fromisoformat(start["dateTime"]).astimezone(get_timezone())
+        return f"{summary} — {dt.strftime('%d/%m %H:%M')}"
+    return f"{summary} — {start.get('date', '')}"
+
+
+def _event_menu(context: ContextTypes.DEFAULT_TYPE, events: list[dict], action: str) -> InlineKeyboardMarkup:
+    """Um botão por evento; a agenda e o ID ficam guardados na memória do bot.
+
+    Agenda e ID do evento juntos passam dos 64 bytes que o Telegram aceita no
+    botão, então ele leva só um resumo dos dois.
+    """
+    choices = context.user_data.setdefault("event_choices", {})
+    buttons = []
+    for event in events:
+        raw_key = f"{event['_calendar_id']}\n{event['id']}".encode("utf-8")
+        key = hashlib.sha256(raw_key).hexdigest()[:16]
+        choices[key] = {
+            "calendar_id": event["_calendar_id"],
+            "event_id": event["id"],
+            "summary": event.get("summary", "Sem título"),
+            "calendar_name": event.get("_calendar_name"),
+            "all_day": "dateTime" not in event["start"],
+        }
+        buttons.append([InlineKeyboardButton(_event_label(event), callback_data=f"{action}:{key}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _chosen_event(context: ContextTypes.DEFAULT_TYPE, key: str) -> dict | None:
+    return context.user_data.get("event_choices", {}).get(key)
+
+
+async def _reply_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, events: list[dict], limit: int):
+    editable = [event for event in events if _can_edit(event)]
+    if not editable:
+        await update.message.reply_text("Nenhum evento que você possa editar nos próximos 30 dias.")
+        return
+
+    text = "✏️ Qual evento deseja editar?"
+    if len(editable) < len(events):
+        text += "\n\nSó aparecem eventos que você pode alterar."
+    await update.message.reply_text(text, reply_markup=_event_menu(context, editable[:limit], "edit"))
+
+
+async def _reply_delete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, events: list[dict], limit: int):
+    deletable = [event for event in events if _can_delete(event)]
+    if not deletable:
+        await update.message.reply_text("Nenhum evento que você possa excluir nos próximos 30 dias.")
+        return
+
+    text = "🗑️ Qual evento deseja excluir?"
+    if len(deletable) < len(events):
+        text += "\n\nSó aparecem eventos que você pode excluir."
+    await update.message.reply_text(text, reply_markup=_event_menu(context, deletable[:limit], "confirmdel"))
+
+
 # --- /editar ---
 
 async def cmd_editar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -486,46 +573,28 @@ async def cmd_editar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Erro ao acessar a agenda. Tente novamente.")
         return
 
-    if not events:
-        await update.message.reply_text("Nenhum evento para editar nos próximos 30 dias.")
-        return
-
-    buttons = []
-    for ev in events[:15]:
-        summary = ev.get("summary", "Sem título")
-        start = ev["start"]
-        if "dateTime" in start:
-            dt = datetime.fromisoformat(start["dateTime"])
-            label = f"{summary} — {dt.strftime('%d/%m %H:%M')}"
-        else:
-            label = f"{summary} — {start.get('date', '')}"
-
-        buttons.append(
-            [InlineKeyboardButton(label, callback_data=f"edit:{ev['id']}")]
-        )
-
-    keyboard = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(
-        "✏️ Qual evento deseja editar?",
-        reply_markup=keyboard,
-    )
+    await _reply_edit_menu(update, context, events, limit=15)
 
 
 async def callback_select_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    event_id = query.data.replace("edit:", "", 1)
-    context.user_data["editing_event_id"] = event_id
+    chosen = _chosen_event(context, query.data.replace("edit:", "", 1))
+    if not chosen:
+        await query.edit_message_text(MENU_EXPIRED_TEXT)
+        return
+    context.user_data["editing_event"] = chosen
 
     buttons = [
         [InlineKeyboardButton("Título", callback_data="editfield:title")],
         [InlineKeyboardButton("Data", callback_data="editfield:date")],
-        [InlineKeyboardButton("Horário", callback_data="editfield:time")],
-        [InlineKeyboardButton("Cancelar", callback_data="editfield:cancel")],
     ]
-    keyboard = InlineKeyboardMarkup(buttons)
-    await query.edit_message_text("O que deseja alterar?", reply_markup=keyboard)
+    # Evento de dia inteiro não tem horário para mudar.
+    if not chosen["all_day"]:
+        buttons.append([InlineKeyboardButton("Horário", callback_data="editfield:time")])
+    buttons.append([InlineKeyboardButton("Cancelar", callback_data="editfield:cancel")])
+    await query.edit_message_text("O que deseja alterar?", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def callback_select_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -535,6 +604,7 @@ async def callback_select_edit_field(update: Update, context: ContextTypes.DEFAU
     field = query.data.replace("editfield:", "", 1)
 
     if field == "cancel":
+        context.user_data.pop("editing_event", None)
         await query.edit_message_text("Edição cancelada.")
         return
 
@@ -549,27 +619,37 @@ async def callback_select_edit_field(update: Update, context: ContextTypes.DEFAU
     await query.edit_message_text(prompts[field])
 
 
+EDIT_FORMAT_ERRORS = {
+    "date": "Data inválida. Use dd/mm/aaaa e comece de novo com /editar.",
+    "time": "Horário inválido. Use hh:mm e comece de novo com /editar.",
+}
+
+
 async def handle_edit_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    event_id = context.user_data.get("editing_event_id")
+    editing = context.user_data.get("editing_event")
     field = context.user_data.get("editing_field")
     telegram_id = update.effective_user.id
     user_id = get_user_id(telegram_id)
 
-    if not event_id or not field or not user_id:
+    if not editing or not field or not user_id:
         return False
 
     value = update.message.text.strip()
     updates = {field: value}
 
     try:
-        update_event(user_id, event_id, updates)
+        update_event(user_id, editing["calendar_id"], editing["event_id"], updates)
         field_names = {"title": "Título", "date": "Data", "time": "Horário"}
         await update.message.reply_text(f"✅ {field_names[field]} atualizado para: {value}")
+    except ValueError:
+        await update.message.reply_text(
+            EDIT_FORMAT_ERRORS.get(field, "Valor inválido. Comece de novo com /editar.")
+        )
     except Exception as e:
         logger.error(f"Erro ao editar evento para {user_id}: {e}")
-        await update.message.reply_text("Erro ao editar evento. Verifique o formato e tente novamente.")
+        await update.message.reply_text("O Google não aceitou a alteração. Tente novamente mais tarde.")
 
-    context.user_data.pop("editing_event_id", None)
+    context.user_data.pop("editing_event", None)
     context.user_data.pop("editing_field", None)
     return True
 
@@ -588,54 +668,42 @@ async def cmd_excluir(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Erro ao acessar a agenda. Tente novamente.")
         return
 
-    if not events:
-        await update.message.reply_text("Nenhum evento para excluir nos próximos 30 dias.")
-        return
-
-    buttons = []
-    for ev in events[:15]:
-        summary = ev.get("summary", "Sem título")
-        start = ev["start"]
-        if "dateTime" in start:
-            dt = datetime.fromisoformat(start["dateTime"])
-            label = f"{summary} — {dt.strftime('%d/%m %H:%M')}"
-        else:
-            label = f"{summary} — {start.get('date', '')}"
-
-        buttons.append(
-            [InlineKeyboardButton(label, callback_data=f"confirmdel:{ev['id']}")]
-        )
-
-    keyboard = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(
-        "🗑️ Qual evento deseja excluir?",
-        reply_markup=keyboard,
-    )
+    await _reply_delete_menu(update, context, events, limit=15)
 
 
 async def callback_confirm_delete_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    event_id = query.data.replace("confirmdel:", "", 1)
+    key = query.data.replace("confirmdel:", "", 1)
+    chosen = _chosen_event(context, key)
+    if not chosen:
+        await query.edit_message_text(MENU_EXPIRED_TEXT)
+        return
+
+    text = f'Tem certeza que deseja excluir "{chosen["summary"]}"?'
+    if chosen["calendar_name"]:
+        text += (
+            f"\n\nEle está na agenda {chosen['calendar_name']} e some para todos "
+            "que usam essa agenda."
+        )
 
     buttons = [
         [
-            InlineKeyboardButton("Sim, excluir", callback_data=f"del:{event_id}"),
+            InlineKeyboardButton("Sim, excluir", callback_data=f"del:{key}"),
             InlineKeyboardButton("Cancelar", callback_data="del:cancel"),
         ]
     ]
-    keyboard = InlineKeyboardMarkup(buttons)
-    await query.edit_message_text("Tem certeza que deseja excluir este evento?", reply_markup=keyboard)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def callback_delete_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    event_id = query.data.replace("del:", "", 1)
+    key = query.data.replace("del:", "", 1)
 
-    if event_id == "cancel":
+    if key == "cancel":
         await query.edit_message_text("Exclusão cancelada.")
         return
 
@@ -645,8 +713,13 @@ async def callback_delete_event(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Erro: usuário não encontrado.")
         return
 
+    chosen = _chosen_event(context, key)
+    if not chosen:
+        await query.edit_message_text(MENU_EXPIRED_TEXT)
+        return
+
     try:
-        delete_event(user_id, event_id)
+        delete_event(user_id, chosen["calendar_id"], chosen["event_id"])
         await query.edit_message_text("✅ Evento excluído com sucesso!")
     except Exception as e:
         logger.error(f"Erro ao excluir evento para {user_id}: {e}")
@@ -1020,7 +1093,7 @@ async def cmd_agendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         confirm_text += "\n\nEm qual agenda?"
         buttons = [
-            [InlineKeyboardButton(cal["name"], callback_data=f"nlcal:{cal['id']}")]
+            [InlineKeyboardButton(cal["name"], callback_data=f"nlcal:{_calendar_key(cal['id'])}")]
             for cal in calendars
         ]
         buttons.append([InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no")])
@@ -1032,22 +1105,23 @@ async def callback_nl_select_calendar(update: Update, context: ContextTypes.DEFA
     query = update.callback_query
     await query.answer()
 
-    calendar_id = query.data.replace("nlcal:", "", 1)
-    context.user_data.setdefault("pending_event", {})["calendar_id"] = calendar_id
+    user_id = get_user_id(query.from_user.id)
+    if not user_id:
+        await query.edit_message_text("Erro: usuário não encontrado.")
+        return
 
-    # Busca nome da agenda para mostrar na confirmação
-    telegram_id = query.from_user.id
-    user_id = get_user_id(telegram_id)
-    cal_name = calendar_id
-    if user_id:
-        try:
-            calendars = list_calendars(user_id)
-            for cal in calendars:
-                if cal["id"] == calendar_id:
-                    cal_name = cal["name"]
-                    break
-        except Exception:
-            pass
+    try:
+        calendar = _find_calendar(list_calendars(user_id), query.data.replace("nlcal:", "", 1))
+    except Exception as e:
+        logger.error(f"Erro ao listar agendas de {user_id}: {e}")
+        await query.edit_message_text("Erro ao acessar suas agendas. Tente novamente.")
+        return
+    if calendar is None:
+        await query.edit_message_text("Essa agenda não está mais disponível. Use /agendar novamente.")
+        return
+
+    context.user_data.setdefault("pending_event", {})["calendar_id"] = calendar["id"]
+    cal_name = calendar["name"]
 
     pending = context.user_data.get("pending_event", {})
     confirm_text = (
@@ -1529,7 +1603,7 @@ async def callback_cancel_calendar_removal(update: Update, context: ContextTypes
 
 async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Se está aguardando resposta de edição, processa isso primeiro
-    if context.user_data.get("editing_event_id") and context.user_data.get("editing_field"):
+    if context.user_data.get("editing_event") and context.user_data.get("editing_field"):
         handled = await handle_edit_response(update, context)
         if handled:
             return
@@ -1632,7 +1706,7 @@ async def _nl_criar_evento(update, context, user_id, result):
     else:
         confirm_text += "\n\nEm qual agenda?"
         buttons = [
-            [InlineKeyboardButton(cal["name"], callback_data=f"nlcal:{cal['id']}")]
+            [InlineKeyboardButton(cal["name"], callback_data=f"nlcal:{_calendar_key(cal['id'])}")]
             for cal in calendars
         ]
         buttons.append([InlineKeyboardButton("Cancelar", callback_data="nlconfirm:no")])
@@ -1659,28 +1733,7 @@ async def _nl_editar_evento(update, context, user_id, result):
         if filtered:
             events = filtered
 
-    if not events:
-        await update.message.reply_text("Nenhum evento encontrado para editar.")
-        return
-
-    buttons = []
-    for ev in events[:10]:
-        summary = ev.get("summary", "Sem título")
-        start = ev["start"]
-        if "dateTime" in start:
-            dt = datetime.fromisoformat(start["dateTime"])
-            label = f"{summary} — {dt.strftime('%d/%m %H:%M')}"
-        else:
-            label = f"{summary} — {start.get('date', '')}"
-        buttons.append(
-            [InlineKeyboardButton(label, callback_data=f"edit:{ev['id']}")]
-        )
-
-    keyboard = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(
-        "✏️ Qual evento deseja editar?",
-        reply_markup=keyboard,
-    )
+    await _reply_edit_menu(update, context, events, limit=10)
 
 
 async def _nl_excluir_evento(update, context, user_id, result):
@@ -1701,28 +1754,7 @@ async def _nl_excluir_evento(update, context, user_id, result):
         if filtered:
             events = filtered
 
-    if not events:
-        await update.message.reply_text("Nenhum evento encontrado para excluir.")
-        return
-
-    buttons = []
-    for ev in events[:10]:
-        summary = ev.get("summary", "Sem título")
-        start = ev["start"]
-        if "dateTime" in start:
-            dt = datetime.fromisoformat(start["dateTime"])
-            label = f"{summary} — {dt.strftime('%d/%m %H:%M')}"
-        else:
-            label = f"{summary} — {start.get('date', '')}"
-        buttons.append(
-            [InlineKeyboardButton(label, callback_data=f"confirmdel:{ev['id']}")]
-        )
-
-    keyboard = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(
-        "🗑️ Qual evento deseja excluir?",
-        reply_markup=keyboard,
-    )
+    await _reply_delete_menu(update, context, events, limit=10)
 
 
 async def _nl_criar_tarefa(update, context, user_id, result):

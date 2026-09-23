@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import os
 from datetime import datetime, timedelta
@@ -8,10 +9,22 @@ from src.calendar_api import get_hidden_calendars, set_calendar_hidden
 from src.telegram_bot import (
     callback_cancel_calendar_removal,
     callback_confirm_calendar_removal,
+    callback_confirm_delete_event,
+    callback_delete_event,
+    callback_nl_confirm,
+    callback_nl_select_calendar,
+    callback_select_calendar,
+    callback_select_edit,
+    callback_select_edit_field,
     callback_toggle_calendar,
     callback_warn_calendar_removal,
+    cmd_agendar,
     cmd_agendas,
+    cmd_criar,
+    cmd_editar,
+    cmd_excluir,
     cmd_remover_agenda,
+    handle_free_text,
     load_users,
     get_user_id,
     is_user_silenced,
@@ -364,3 +377,271 @@ class TestComandoRemoverAgenda:
 
         with patch("src.calendar_api.HIDDEN_CALENDARS_PATH", hidden_path):
             assert get_hidden_calendars("matheus") == set()
+
+
+class FakeGoogleCalendar:
+    """Agendas e eventos em memória, respondendo como a API do Google.
+
+    Pedir um evento à agenda errada dá erro, como no Google. É assim que os
+    testes provam que a edição foi para a agenda certa.
+    """
+
+    def __init__(self, calendars: list[dict], events: dict[str, list[dict]]):
+        self.events = events
+        self.updated: list[tuple[str, str, dict]] = []
+        self.deleted: list[tuple[str, str]] = []
+        self.created: list[tuple[str, dict]] = []
+
+        self.service = MagicMock()
+        self.service.calendarList.return_value.list.return_value.execute.return_value = {
+            "items": calendars
+        }
+        events_api = self.service.events.return_value
+        events_api.list.side_effect = self._list
+        events_api.get.side_effect = self._get
+        events_api.update.side_effect = self._update
+        events_api.delete.side_effect = self._delete
+        events_api.insert.side_effect = self._insert
+
+    @staticmethod
+    def _request(result=None, error: Exception | None = None) -> MagicMock:
+        request = MagicMock()
+        if error:
+            request.execute.side_effect = error
+        else:
+            request.execute.return_value = result
+        return request
+
+    def _stored(self, calendar_id: str, event_id: str) -> dict | None:
+        return next((ev for ev in self.events.get(calendar_id, []) if ev["id"] == event_id), None)
+
+    def _list(self, calendarId, **_kwargs):
+        return self._request({"items": copy.deepcopy(self.events.get(calendarId, []))})
+
+    def _get(self, calendarId, eventId, **_kwargs):
+        event = self._stored(calendarId, eventId)
+        if event is None:
+            return self._request(error=RuntimeError("404 Not Found"))
+        return self._request(copy.deepcopy(event))
+
+    def _update(self, calendarId, eventId, body, **_kwargs):
+        if self._stored(calendarId, eventId) is None:
+            return self._request(error=RuntimeError("404 Not Found"))
+        self.updated.append((calendarId, eventId, body))
+        return self._request(body)
+
+    def _delete(self, calendarId, eventId, **_kwargs):
+        if self._stored(calendarId, eventId) is None:
+            return self._request(error=RuntimeError("404 Not Found"))
+        self.deleted.append((calendarId, eventId))
+        return self._request("")
+
+    def _insert(self, calendarId, body, **_kwargs):
+        self.created.append((calendarId, body))
+        return self._request({**body, "id": "novo"})
+
+
+class TestEditarEExcluirEmQualquerAgenda:
+    EU = "matheus@gmail.com"
+    FAMILIA = "c_" + "9f" * 32 + "@group.calendar.google.com"
+    FERIADOS = "pt-br.brazilian#holiday@group.v.calendar.google.com"
+    # Evento importado de outro sistema: ID bem maior que o normal.
+    ID_IMPORTADO = "0400000082" + "0e" * 45
+
+    CALENDARS = [
+        {"id": EU, "summary": "Matheus", "accessRole": "owner", "primary": True},
+        {"id": FAMILIA, "summary": "Família", "accessRole": "writer"},
+        {"id": FERIADOS, "summary": "Feriados no Brasil", "accessRole": "reader"},
+    ]
+
+    @staticmethod
+    def _timed(event_id: str, summary: str, organizer_here: bool = True) -> dict:
+        return {
+            "id": event_id,
+            "summary": summary,
+            "start": {"dateTime": "2026-10-09T20:00:00-03:00"},
+            "end": {"dateTime": "2026-10-09T22:00:00-03:00"},
+            "organizer": {"self": True} if organizer_here else {"email": "sindico@condominio.com"},
+        }
+
+    def setup_method(self):
+        viagem = {
+            "id": "viagem", "summary": "Viagem", "organizer": {"self": True},
+            "start": {"date": "2026-10-10"}, "end": {"date": "2026-10-13"},
+        }
+        feriado = {
+            "id": "feriado", "summary": "Feriado", "organizer": {"self": True},
+            "start": {"date": "2026-10-12"}, "end": {"date": "2026-10-13"},
+        }
+        self.google = FakeGoogleCalendar(self.CALENDARS, {
+            self.EU: [
+                self._timed("dentista", "Dentista"),
+                # Convite de outra pessoa: só quem organiza muda.
+                self._timed("condominio", "Reunião do condomínio", organizer_here=False),
+            ],
+            self.FAMILIA: [
+                self._timed("jantar", "Jantar em família"),
+                self._timed(self.ID_IMPORTADO, "Churrasco"),
+                viagem,
+            ],
+            self.FERIADOS: [feriado],
+        })
+        self.context = MagicMock()
+        self.context.user_data = {}
+
+    def _run(self, handler, update, tmp_path):
+        with patch("src.calendar_api.HIDDEN_CALENDARS_PATH", str(tmp_path / "ocultas.json")), \
+             patch("src.calendar_api.get_calendar_service", return_value=self.google.service), \
+             patch("src.telegram_bot.check_user", AsyncMock(return_value="matheus")), \
+             patch("src.telegram_bot.get_user_id", return_value="matheus"), \
+             patch("src.telegram_bot.is_user_authenticated", return_value=True):
+            asyncio.run(handler(update, self.context))
+
+    def _command(self, handler, tmp_path, args: list[str] | None = None) -> AsyncMock:
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+        self.context.args = args or []
+        self._run(handler, update, tmp_path)
+        return update.message.reply_text
+
+    def _type(self, text: str, tmp_path) -> AsyncMock:
+        update = MagicMock()
+        update.message.text = text
+        update.message.reply_text = AsyncMock()
+        self._run(handle_free_text, update, tmp_path)
+        return update.message.reply_text
+
+    def _tap(self, handler, callback_data: str, tmp_path) -> AsyncMock:
+        query = MagicMock()
+        query.data = callback_data
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+        self._run(handler, update, tmp_path)
+        return query.edit_message_text
+
+    @staticmethod
+    def _buttons(reply: AsyncMock) -> dict[str, str]:
+        markup = reply.call_args.kwargs["reply_markup"]
+        return {button.text: button.callback_data for row in markup.inline_keyboard for button in row}
+
+    @staticmethod
+    def _pick(buttons: dict[str, str], summary: str) -> str:
+        return next(data for text, data in buttons.items() if text.startswith(summary))
+
+    def test_editar_so_lista_o_que_da_para_alterar(self, tmp_path):
+        reply = self._command(cmd_editar, tmp_path)
+
+        summaries = sorted(text.split(" — ")[0] for text in self._buttons(reply))
+        assert summaries == [
+            "Churrasco [Família]", "Dentista", "Jantar em família [Família]", "Viagem [Família]",
+        ]
+        assert "Só aparecem eventos que você pode alterar" in reply.call_args.args[0]
+
+    def test_excluir_nao_lista_agenda_so_de_leitura(self, tmp_path):
+        reply = self._command(cmd_excluir, tmp_path)
+
+        summaries = [text.split(" — ")[0] for text in self._buttons(reply)]
+        assert "Feriado [Feriados no Brasil]" not in summaries
+        assert "Churrasco [Família]" in summaries
+
+    def test_mesmo_compromisso_em_duas_agendas_mostra_de_onde_vem_cada_botao(self, tmp_path):
+        # Convite da Cecília: a cópia do Matheus e o original na agenda dela.
+        cecilia = "cecilia@gmail.com"
+        self.CALENDARS.append({"id": cecilia, "summary": "Cecilia", "accessRole": "writer"})
+        self.google.events[cecilia] = [self._timed("aniversario", "Aniversário da Raiane")]
+        self.google.events[self.EU].append(
+            self._timed("aniversario", "Aniversário da Raiane", organizer_here=False)
+        )
+        try:
+            labels = list(self._buttons(self._command(cmd_excluir, tmp_path)))
+        finally:
+            self.CALENDARS.pop()
+
+        copies = [label for label in labels if label.startswith("Aniversário da Raiane")]
+        assert len(copies) == 2 and len(set(copies)) == 2
+
+    def test_botoes_de_evento_cabem_no_limite_do_telegram(self, tmp_path):
+        for handler in (cmd_editar, cmd_excluir):
+            buttons = self._buttons(self._command(handler, tmp_path))
+            assert all(len(data.encode("utf-8")) <= 64 for data in buttons.values())
+
+    def test_editar_evento_da_familia_altera_na_agenda_da_familia(self, tmp_path):
+        # Regressão: a edição sempre ia para a agenda principal, e o Google não
+        # achava o evento.
+        buttons = self._buttons(self._command(cmd_editar, tmp_path))
+        self._tap(callback_select_edit, self._pick(buttons, "Jantar em família"), tmp_path)
+        self._tap(callback_select_edit_field, "editfield:title", tmp_path)
+
+        reply = self._type("Jantar na vovó", tmp_path)
+
+        assert [(cal, ev, body["summary"]) for cal, ev, body in self.google.updated] == [
+            (self.FAMILIA, "jantar", "Jantar na vovó")
+        ]
+        assert "✅" in reply.call_args.args[0]
+
+    def test_evento_de_dia_inteiro_nao_oferece_mudar_horario(self, tmp_path):
+        buttons = self._buttons(self._command(cmd_editar, tmp_path))
+
+        fields = self._tap(callback_select_edit, self._pick(buttons, "Viagem"), tmp_path)
+
+        assert list(self._buttons(fields)) == ["Título", "Data", "Cancelar"]
+
+    def test_excluir_evento_da_familia_exclui_na_agenda_da_familia(self, tmp_path):
+        buttons = self._buttons(self._command(cmd_excluir, tmp_path))
+        confirm = self._tap(callback_confirm_delete_event, self._pick(buttons, "Churrasco"), tmp_path)
+        assert "Família" in confirm.call_args.args[0]
+
+        done = self._tap(callback_delete_event, self._buttons(confirm)["Sim, excluir"], tmp_path)
+
+        assert self.google.deleted == [(self.FAMILIA, self.ID_IMPORTADO)]
+        assert "✅" in done.call_args.args[0]
+
+    def test_menu_de_antes_de_reiniciar_avisa_e_nao_mexe_em_nada(self, tmp_path):
+        buttons = self._buttons(self._command(cmd_excluir, tmp_path))
+        self.context.user_data = {}  # o bot reiniciou e perdeu a memória
+
+        reply = self._tap(callback_confirm_delete_event, self._pick(buttons, "Dentista"), tmp_path)
+
+        assert "expirou" in reply.call_args.args[0]
+        assert self.google.deleted == []
+
+    def test_data_invalida_explica_o_formato_sem_culpar_o_google(self, tmp_path):
+        buttons = self._buttons(self._command(cmd_editar, tmp_path))
+        self._tap(callback_select_edit, self._pick(buttons, "Dentista"), tmp_path)
+        self._tap(callback_select_edit_field, "editfield:date", tmp_path)
+
+        reply = self._type("31/02/2026", tmp_path)
+
+        assert "dd/mm/aaaa" in reply.call_args.args[0]
+        assert self.google.updated == []
+
+    def test_pedido_por_texto_para_excluir_usa_o_mesmo_menu(self, tmp_path):
+        intent = {"intent": "excluir_evento", "search_term": "churrasco"}
+        with patch("src.telegram_bot.parse_intent", AsyncMock(return_value=intent)):
+            buttons = self._buttons(self._type("apaga o churrasco", tmp_path))
+
+        confirm = self._tap(callback_confirm_delete_event, self._pick(buttons, "Churrasco"), tmp_path)
+        self._tap(callback_delete_event, self._buttons(confirm)["Sim, excluir"], tmp_path)
+
+        assert self.google.deleted == [(self.FAMILIA, self.ID_IMPORTADO)]
+
+    def test_criar_em_agenda_de_id_longo_cria_na_agenda_escolhida(self, tmp_path):
+        buttons = self._buttons(self._command(cmd_criar, tmp_path, ["Pizza", "10/10/2026", "20:00"]))
+        assert all(len(data.encode("utf-8")) <= 64 for data in buttons.values())
+
+        self._tap(callback_select_calendar, buttons["Família"], tmp_path)
+
+        assert [calendar for calendar, _body in self.google.created] == [self.FAMILIA]
+
+    def test_agendar_por_texto_em_agenda_de_id_longo_cria_na_agenda_escolhida(self, tmp_path):
+        parsed = {"title": "Pizza", "date": "10/10/2026", "time": "20:00", "recurrence": None}
+        with patch("src.telegram_bot.parse_event_from_text", AsyncMock(return_value=parsed)):
+            buttons = self._buttons(self._command(cmd_agendar, tmp_path, ["pizza", "sábado"]))
+        assert all(len(data.encode("utf-8")) <= 64 for data in buttons.values())
+
+        confirm = self._tap(callback_nl_select_calendar, buttons["Família"], tmp_path)
+        self._tap(callback_nl_confirm, self._buttons(confirm)["Confirmar"], tmp_path)
+
+        assert [calendar for calendar, _body in self.google.created] == [self.FAMILIA]
