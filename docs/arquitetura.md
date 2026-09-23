@@ -139,7 +139,7 @@ Cada pessoa pode esconder do bot uma agenda que não quer ver (ex.: `Feriados no
 - **Estado em `estado/agendas_ocultas.json`**, por nome de usuário. Arquivo ilegível vira "nada oculto", com log de erro: melhor mostrar agenda a mais do que parar os avisos.
 - **O botão leva um resumo do ID, não o ID.** O Telegram limita o dado do botão a 64 bytes, e o ID das agendas novas do Google passa disso.
 
-Agenda oculta no próprio Google ("Ocultar da lista") também some do bot, porque a API não devolve agendas ocultas por padrão.
+Agenda oculta no próprio Google ("Ocultar na lista") também some do bot, porque a API não devolve agendas ocultas por padrão.
 
 ## Testes
 
