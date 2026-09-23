@@ -3,7 +3,12 @@ from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from src.calendar_api import (
+    delete_event,
+    parse_duration,
+    resolve_guests,
     format_event,
     format_event_short,
     format_task,
@@ -355,6 +360,7 @@ class TestUpdateEvent:
         get_kwargs = service.events.return_value.get.call_args.kwargs
         update_kwargs = service.events.return_value.update.call_args.kwargs
         assert get_kwargs["calendarId"] == update_kwargs["calendarId"] == self.FAMILIA
+        self.send_updates = update_kwargs.get("sendUpdates")
         return update_kwargs["body"]
 
     # Regressão: agenda compartilhada pode devolver o horário em UTC. O jantar
@@ -390,6 +396,132 @@ class TestUpdateEvent:
 
         assert body["start"] == {"date": "2026-10-20"}
         assert body["end"] == {"date": "2026-10-23"}
+
+    def test_mudar_duracao_muda_so_o_fim_no_horario_local(self):
+        body = self._update(dict(self.JANTAR_EM_UTC), {"duration": "1h"})
+
+        assert body["start"] == self.JANTAR_EM_UTC["start"]
+        assert body["end"] == {"dateTime": "2026-10-09T23:00:00", "timeZone": "America/Fortaleza"}
+
+    def test_duracao_em_evento_de_dia_inteiro_e_recusada(self):
+        viagem = {"summary": "Viagem", "start": {"date": "2026-10-10"}, "end": {"date": "2026-10-13"}}
+
+        with pytest.raises(ValueError):
+            self._update(viagem, {"duration": "2h"})
+
+    def test_troca_local_e_apaga_descricao(self):
+        jantar = {**self.JANTAR_EM_UTC, "description": "Levar sobremesa"}
+
+        body = self._update(jantar, {"location": "Casa da vovó"})
+        assert body["location"] == "Casa da vovó"
+
+        body = self._update(jantar, {"description": ""})
+        assert body["description"] == ""
+
+    def test_convidar_nao_repete_quem_ja_esta_e_avisa_por_email(self):
+        jantar = {**self.JANTAR_EM_UTC, "attendees": [{"email": "Mae@gmail.com"}]}
+
+        body = self._update(jantar, {"add_attendees": ["mae@gmail.com", "joao@gmail.com"]})
+
+        assert body["attendees"] == [{"email": "Mae@gmail.com"}, {"email": "joao@gmail.com"}]
+        assert self.send_updates == "all"
+
+    def test_mesmo_email_duas_vezes_entra_uma_vez_so(self):
+        body = self._update(dict(self.JANTAR_EM_UTC), {"add_attendees": ["ana@x.com", "ANA@x.com"]})
+
+        assert body["attendees"] == [{"email": "ana@x.com"}]
+
+    def test_tirar_o_ultimo_convidado_tambem_avisa_por_email(self):
+        # Sem o e-mail, quem saiu não fica sabendo.
+        jantar = {**self.JANTAR_EM_UTC, "attendees": [{"email": "joao@gmail.com"}]}
+
+        body = self._update(jantar, {"remove_attendees": ["JOAO@gmail.com"]})
+
+        assert body["attendees"] == []
+        assert self.send_updates == "all"
+
+    def test_mudanca_em_evento_sem_convidados_nao_manda_email(self):
+        self._update(dict(self.JANTAR_EM_UTC), {"title": "Jantar"})
+
+        assert self.send_updates == "none"
+
+
+class TestDeleteEvent:
+    def _delete(self, event: dict) -> str:
+        """Exclui e devolve para quem o Google mandaria e-mail."""
+        service = MagicMock()
+        service.events.return_value.get.return_value.execute.return_value = event
+        with patch("src.calendar_api.get_calendar_service", return_value=service):
+            delete_event("matheus", "familia@group.calendar.google.com", "jantar")
+        return service.events.return_value.delete.call_args.kwargs["sendUpdates"]
+
+    def test_quem_organiza_avisa_os_convidados_do_cancelamento(self):
+        jantar = {"organizer": {"self": True}, "attendees": [{"email": "mae@gmail.com"}]}
+
+        assert self._delete(jantar) == "all"
+
+    def test_quem_foi_convidado_sai_sem_mandar_email(self):
+        convite = {"organizer": {"email": "cecilia@gmail.com"}, "attendees": [{"email": "mae@gmail.com"}]}
+
+        assert self._delete(convite) == "none"
+
+
+class TestParseDuration:
+    def test_entende_os_formatos_do_dia_a_dia(self):
+        cases = {"1h": 60, "1h30": 90, "1h30min": 90, "90min": 90, "45": 45,
+                 "2h 15min": 135, "1:30": 90, " 45 min ": 45}
+        for text, minutes in cases.items():
+            assert parse_duration(text) == timedelta(minutes=minutes), text
+
+    def test_recusa_o_que_nao_e_duracao(self):
+        for text in ["", "abc", "0", "0h", "uma hora", "-1h"]:
+            with pytest.raises(ValueError):
+                parse_duration(text)
+
+
+class TestResolveGuests:
+    CONTACTS = {"connections": [
+        {"names": [{"displayName": "Mãe", "givenName": "Mãe"}],
+         "emailAddresses": [{"value": "mae@gmail.com"}]},
+        {"names": [{"displayName": "João Silva", "givenName": "João"}],
+         "emailAddresses": [{"value": "joao@gmail.com"}]},
+        {"names": [{"displayName": "João Pedro", "givenName": "João"}],
+         "emailAddresses": [{"value": "jp@gmail.com"}]},
+        {"names": [{"displayName": "Cecília Norjosa", "givenName": "Cecília"}],
+         "emailAddresses": [{"value": "cecilia@gmail.com"}]},
+        {"names": [{"displayName": "Sem E-mail"}]},
+    ]}
+
+    def _resolve(self, entries: list[str]) -> tuple[list[dict], list[str]]:
+        people = MagicMock()
+        people.people.return_value.connections.return_value.list.return_value.execute.return_value = self.CONTACTS
+        with patch("src.calendar_api.get_people_service", return_value=people):
+            return resolve_guests("matheus", entries)
+
+    def test_troca_nome_por_email_sem_ligar_para_acento_nem_maiuscula(self):
+        guests, problems = self._resolve(["mae", "CECILIA", "joão silva"])
+
+        assert [guest["email"] for guest in guests] == ["mae@gmail.com", "cecilia@gmail.com", "joao@gmail.com"]
+        assert problems == []
+
+    def test_email_digitado_passa_direto(self):
+        guests, problems = self._resolve(["ana@exemplo.com"])
+
+        assert guests == [{"name": None, "email": "ana@exemplo.com"}]
+        assert problems == []
+
+    def test_nome_de_mais_de_um_contato_nao_vira_convite(self):
+        # Convidar o João errado manda e-mail para outra pessoa.
+        guests, problems = self._resolve(["joão"])
+
+        assert guests == []
+        assert "joao@gmail.com" in problems[0] and "jp@gmail.com" in problems[0]
+
+    def test_nome_sem_contato_com_email_nao_vira_convite(self):
+        guests, problems = self._resolve(["Ronaldo", "Sem E-mail"])
+
+        assert guests == []
+        assert len(problems) == 2
 
 
 class TestEventosDeVariosDias:

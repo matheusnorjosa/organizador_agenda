@@ -140,7 +140,12 @@ Cada evento da lista carrega a agenda de onde veio (`_calendar_id`) e o acesso d
 
 - **O botão leva um resumo de agenda + evento**, e o par fica em `context.user_data["event_choices"]`. Um ID de evento importado passa sozinho dos 64 bytes. Depois de um reinício do bot, o menu antigo avisa que expirou.
 - **O botão mostra a agenda** (`Churrasco [Família]`). O mesmo compromisso pode vir de duas agendas, o original e a cópia do convite, e excluir cada um faz uma coisa diferente.
-- **Evento de dia inteiro** não oferece "Horário". Trocar a data mantém a quantidade de dias (o fim é exclusivo no Google).
+- **Campos:** título, data, horário, duração, local, descrição e participantes. Em local e descrição, "-" apaga.
+- **Participantes:** nome de contato vira e-mail só quando corresponde a um contato só. A comparação ignora acento e maiúscula, e vale o nome completo ou o primeiro nome. Nome ambíguo ou desconhecido faz o bot pedir o e-mail. Nenhum convite sai antes da confirmação, e tirar alguém também pede confirmação. Quem já está convidado não é convidado de novo.
+- **O botão "Confirmar convites" leva a chave daquele convite** (evento + pessoas), guardado em `pending_invites`. Com duas edições abertas, um botão antigo só confirma o que mostrou: antes, o convite podia ir para o evento da outra edição. Os botões de campo (Título, Local...) também levam o evento do menu, e o pedido de valor mostra o nome dele. Abrir o `/editar` ou escolher outro evento zera o campo em edição.
+- **E-mail do Google:** se o evento tem convidados, qualquer mudança pelo bot usa `sendUpdates="all"`, inclusive para quem acabou de sair da lista. O bot avisa disso antes, quando a pessoa escolhe o campo. Na exclusão, os convidados só são avisados quando a pessoa é quem organiza; quem foi convidado tira o evento da própria agenda sem mandar e-mail.
+- **Log:** só a quantidade de convidados, nunca o e-mail. O log do container aparece no deploy, que é público.
+- **Evento de dia inteiro** não oferece "Horário" nem "Duração". Trocar a data mantém a quantidade de dias (o fim é exclusivo no Google).
 - Evento que se repete: a mudança vale só para aquela ocorrência (a lista usa `singleEvents=True`).
 
 ### Agendas ocultas (`/agendas`)
