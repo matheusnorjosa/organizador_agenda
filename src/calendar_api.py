@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import re
 import threading
+import unicodedata
 from datetime import datetime, timedelta, date, time as dt_time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -432,12 +434,38 @@ def create_event(
     return created
 
 
+def get_event(user_id: str, calendar_id: str, event_id: str) -> dict:
+    service = get_calendar_service(user_id)
+    return service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+
+
+def parse_duration(text: str) -> timedelta:
+    """Entende "1h", "1h30", "90min", "45" (minutos) e "1:30"."""
+    cleaned = text.strip().lower()
+    clock = re.fullmatch(r"(\d+):(\d{2})", cleaned)
+    if clock:
+        minutes = int(clock[1]) * 60 + int(clock[2])
+    else:
+        match = re.fullmatch(r"(?:(\d+)\s*h)?\s*(?:(\d+)\s*(?:min|m)?)?", cleaned)
+        if not match or not any(match.groups()):
+            raise ValueError(f"Duração não reconhecida: {text!r}")
+        minutes = int(match[1] or 0) * 60 + int(match[2] or 0)
+    if minutes <= 0:
+        raise ValueError("A duração precisa ser maior que zero.")
+    return timedelta(minutes=minutes)
+
+
 def update_event(user_id: str, calendar_id: str, event_id: str, updates: dict) -> dict:
     service = get_calendar_service(user_id)
     event = service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+    guests_before = event.get("attendees", [])
 
     if "title" in updates:
         event["summary"] = updates["title"]
+    if "location" in updates:
+        event["location"] = updates["location"]
+    if "description" in updates:
+        event["description"] = updates["description"]
 
     if "date" in updates or "time" in updates:
         if "dateTime" in event["start"]:
@@ -445,7 +473,31 @@ def update_event(user_id: str, calendar_id: str, event_id: str, updates: dict) -
         else:
             _move_all_day_event(event, updates)
 
-    return service.events().update(calendarId=calendar_id, eventId=event_id, body=event).execute()
+    if "duration" in updates:
+        if "dateTime" not in event["start"]:
+            raise ValueError("Evento de dia inteiro não tem duração em horas.")
+        start = _parse_event_datetime(event["start"]["dateTime"])
+        end = start + parse_duration(updates["duration"])
+        event["end"] = {"dateTime": end.replace(tzinfo=None).isoformat(), "timeZone": str(get_timezone())}
+
+    if "add_attendees" in updates:
+        known = {guest["email"].lower() for guest in guests_before}
+        new_guests = []
+        for email in updates["add_attendees"]:
+            if email.lower() not in known:
+                known.add(email.lower())
+                new_guests.append({"email": email})
+        event["attendees"] = guests_before + new_guests
+    if "remove_attendees" in updates:
+        leaving = {email.lower() for email in updates["remove_attendees"]}
+        event["attendees"] = [guest for guest in guests_before if guest["email"].lower() not in leaving]
+
+    # Convidado só fica sabendo da mudança pelo e-mail do Google, inclusive
+    # quem acabou de sair da lista.
+    send_updates = "all" if guests_before or event.get("attendees") else "none"
+    return service.events().update(
+        calendarId=calendar_id, eventId=event_id, body=event, sendUpdates=send_updates,
+    ).execute()
 
 
 def _reschedule_timed_event(event: dict, updates: dict):
@@ -481,7 +533,12 @@ def _move_all_day_event(event: dict, updates: dict):
 
 def delete_event(user_id: str, calendar_id: str, event_id: str):
     service = get_calendar_service(user_id)
-    service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+    event = service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+    # Quem organiza avisa o cancelamento aos convidados. Quem só foi
+    # convidado tira o evento da própria agenda sem mandar e-mail.
+    organizer_here = event.get("organizer", {}).get("self", False)
+    send_updates = "all" if organizer_here and event.get("attendees") else "none"
+    service.events().delete(calendarId=calendar_id, eventId=event_id, sendUpdates=send_updates).execute()
 
 
 # --- Horários livres ---
@@ -566,6 +623,69 @@ def get_upcoming_birthdays(user_id: str, days_ahead: int = 7) -> list[dict]:
 
     upcoming.sort(key=lambda x: x["date"])
     return upcoming
+
+
+# --- Convidados (contatos do Google) ---
+
+EMAIL_PATTERN = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+
+def _normalize_name(text: str) -> str:
+    # "Cecília" e "cecilia" são a mesma pessoa para quem digita no celular.
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(char for char in decomposed if not unicodedata.combining(char)).casefold().strip()
+
+
+def _contacts_with_email(user_id: str) -> list[dict]:
+    service = get_people_service(user_id)
+    result = service.people().connections().list(
+        resourceName="people/me",
+        pageSize=1000,
+        personFields="names,emailAddresses",
+    ).execute()
+
+    contacts = []
+    for person in result.get("connections", []):
+        names = person.get("names", [])
+        emails = person.get("emailAddresses", [])
+        if not names or not emails:
+            continue
+        name = names[0]
+        contacts.append({
+            "display_name": name.get("displayName", ""),
+            # Nome completo ou só o primeiro nome: é assim que se chama alguém.
+            "keys": {_normalize_name(name.get("displayName", "")), _normalize_name(name.get("givenName", ""))} - {""},
+            "email": emails[0]["value"],
+        })
+    return contacts
+
+
+def resolve_guests(user_id: str, entries: list[str]) -> tuple[list[dict], list[str]]:
+    """Troca nomes de contato por e-mail; devolve os convidados e os problemas.
+
+    Nome que serve para mais de um contato não é resolvido: convidar a pessoa
+    errada manda e-mail para quem não tem nada a ver com o evento.
+    """
+    guests, problems = [], []
+    contacts = None
+    for entry in entries:
+        if EMAIL_PATTERN.fullmatch(entry):
+            guests.append({"name": None, "email": entry})
+            continue
+        if contacts is None:
+            contacts = _contacts_with_email(user_id)
+        wanted = _normalize_name(entry)
+        matches = {contact["email"]: contact for contact in contacts if wanted in contact["keys"]}
+        if len(matches) == 1:
+            contact = next(iter(matches.values()))
+            guests.append({"name": contact["display_name"], "email": contact["email"]})
+        elif not matches:
+            problems.append(f'Não achei "{entry}" nos seus contatos com e-mail.')
+        else:
+            problems.append(
+                f'Mais de um contato se chama "{entry}": {", ".join(sorted(matches))}. Digite o e-mail.'
+            )
+    return guests, problems
 
 
 def get_tasks_service(user_id: str):

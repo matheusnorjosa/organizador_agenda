@@ -74,7 +74,7 @@ compartilhadas: [docs/arquitetura.md](docs/arquitetura.md).
 | `/agendar <texto>` | Cria evento por linguagem natural |
 | `/criar <título> <data> <hora>` | Cria evento com formato fixo |
 | `/criar_casal <título> <data> <hora>` | Cria nas agendas de todos |
-| `/editar` | Edita título, data ou hora de um evento |
+| `/editar` | Edita título, data, horário, duração, local, descrição e participantes |
 | `/excluir` | Exclui um evento (com confirmação) |
 | `/livre` | Horários vagos de hoje |
 | `/semana` | Programação da semana |

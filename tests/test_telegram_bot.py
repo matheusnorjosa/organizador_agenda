@@ -7,8 +7,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.calendar_api import get_hidden_calendars, set_calendar_hidden
 from src.telegram_bot import (
+    callback_ask_remove_guest,
     callback_cancel_calendar_removal,
+    callback_cancel_guests,
+    callback_confirm_add_guests,
     callback_confirm_calendar_removal,
+    callback_confirm_remove_guest,
     callback_confirm_delete_event,
     callback_delete_event,
     callback_nl_confirm,
@@ -391,6 +395,9 @@ class FakeGoogleCalendar:
         self.updated: list[tuple[str, str, dict]] = []
         self.deleted: list[tuple[str, str]] = []
         self.created: list[tuple[str, dict]] = []
+        # Opções de cada chamada, como sendUpdates (quem recebe e-mail).
+        self.update_options: list[dict] = []
+        self.delete_options: list[dict] = []
 
         self.service = MagicMock()
         self.service.calendarList.return_value.list.return_value.execute.return_value = {
@@ -424,16 +431,18 @@ class FakeGoogleCalendar:
             return self._request(error=RuntimeError("404 Not Found"))
         return self._request(copy.deepcopy(event))
 
-    def _update(self, calendarId, eventId, body, **_kwargs):
+    def _update(self, calendarId, eventId, body, **options):
         if self._stored(calendarId, eventId) is None:
             return self._request(error=RuntimeError("404 Not Found"))
         self.updated.append((calendarId, eventId, body))
+        self.update_options.append(options)
         return self._request(body)
 
-    def _delete(self, calendarId, eventId, **_kwargs):
+    def _delete(self, calendarId, eventId, **options):
         if self._stored(calendarId, eventId) is None:
             return self._request(error=RuntimeError("404 Not Found"))
         self.deleted.append((calendarId, eventId))
+        self.delete_options.append(options)
         return self._request("")
 
     def _insert(self, calendarId, body, **_kwargs):
@@ -441,7 +450,9 @@ class FakeGoogleCalendar:
         return self._request({**body, "id": "novo"})
 
 
-class TestEditarEExcluirEmQualquerAgenda:
+class CenarioAgendas:
+    """Agendas do Matheus e o Google simulado; os testes de edição herdam daqui."""
+
     EU = "matheus@gmail.com"
     FAMILIA = "c_" + "9f" * 32 + "@group.calendar.google.com"
     FERIADOS = "pt-br.brazilian#holiday@group.v.calendar.google.com"
@@ -473,6 +484,12 @@ class TestEditarEExcluirEmQualquerAgenda:
             "id": "feriado", "summary": "Feriado", "organizer": {"self": True},
             "start": {"date": "2026-10-12"}, "end": {"date": "2026-10-13"},
         }
+        jantar = self._timed("jantar", "Jantar em família")
+        jantar["attendees"] = [
+            {"email": self.EU, "self": True, "organizer": True, "responseStatus": "accepted"},
+            {"email": "mae@gmail.com", "displayName": "Mãe", "responseStatus": "accepted"},
+            {"email": "joao@gmail.com", "responseStatus": "needsAction"},
+        ]
         self.google = FakeGoogleCalendar(self.CALENDARS, {
             self.EU: [
                 self._timed("dentista", "Dentista"),
@@ -480,18 +497,32 @@ class TestEditarEExcluirEmQualquerAgenda:
                 self._timed("condominio", "Reunião do condomínio", organizer_here=False),
             ],
             self.FAMILIA: [
-                self._timed("jantar", "Jantar em família"),
+                jantar,
                 self._timed(self.ID_IMPORTADO, "Churrasco"),
                 viagem,
             ],
             self.FERIADOS: [feriado],
         })
+        self.people = MagicMock()
+        self.people.people.return_value.connections.return_value.list.return_value.execute.return_value = {
+            "connections": [
+                {"names": [{"displayName": "Mãe", "givenName": "Mãe"}],
+                 "emailAddresses": [{"value": "mae@gmail.com"}]},
+                {"names": [{"displayName": "Ana Souza", "givenName": "Ana"}],
+                 "emailAddresses": [{"value": "ana@exemplo.com"}]},
+                {"names": [{"displayName": "João Silva", "givenName": "João"}],
+                 "emailAddresses": [{"value": "joao@gmail.com"}]},
+                {"names": [{"displayName": "João Pedro", "givenName": "João"}],
+                 "emailAddresses": [{"value": "jp@gmail.com"}]},
+            ]
+        }
         self.context = MagicMock()
         self.context.user_data = {}
 
     def _run(self, handler, update, tmp_path):
         with patch("src.calendar_api.HIDDEN_CALENDARS_PATH", str(tmp_path / "ocultas.json")), \
              patch("src.calendar_api.get_calendar_service", return_value=self.google.service), \
+             patch("src.calendar_api.get_people_service", return_value=self.people), \
              patch("src.telegram_bot.check_user", AsyncMock(return_value="matheus")), \
              patch("src.telegram_bot.get_user_id", return_value="matheus"), \
              patch("src.telegram_bot.is_user_authenticated", return_value=True):
@@ -530,6 +561,8 @@ class TestEditarEExcluirEmQualquerAgenda:
     def _pick(buttons: dict[str, str], summary: str) -> str:
         return next(data for text, data in buttons.items() if text.startswith(summary))
 
+
+class TestEditarEExcluirEmQualquerAgenda(CenarioAgendas):
     def test_editar_so_lista_o_que_da_para_alterar(self, tmp_path):
         reply = self._command(cmd_editar, tmp_path)
 
@@ -571,8 +604,8 @@ class TestEditarEExcluirEmQualquerAgenda:
         # Regressão: a edição sempre ia para a agenda principal, e o Google não
         # achava o evento.
         buttons = self._buttons(self._command(cmd_editar, tmp_path))
-        self._tap(callback_select_edit, self._pick(buttons, "Jantar em família"), tmp_path)
-        self._tap(callback_select_edit_field, "editfield:title", tmp_path)
+        fields = self._tap(callback_select_edit, self._pick(buttons, "Jantar em família"), tmp_path)
+        self._tap(callback_select_edit_field, self._buttons(fields)["Título"], tmp_path)
 
         reply = self._type("Jantar na vovó", tmp_path)
 
@@ -586,7 +619,9 @@ class TestEditarEExcluirEmQualquerAgenda:
 
         fields = self._tap(callback_select_edit, self._pick(buttons, "Viagem"), tmp_path)
 
-        assert list(self._buttons(fields)) == ["Título", "Data", "Cancelar"]
+        assert list(self._buttons(fields)) == [
+            "Título", "Data", "Local", "Descrição", "Participantes", "Cancelar",
+        ]
 
     def test_excluir_evento_da_familia_exclui_na_agenda_da_familia(self, tmp_path):
         buttons = self._buttons(self._command(cmd_excluir, tmp_path))
@@ -609,8 +644,8 @@ class TestEditarEExcluirEmQualquerAgenda:
 
     def test_data_invalida_explica_o_formato_sem_culpar_o_google(self, tmp_path):
         buttons = self._buttons(self._command(cmd_editar, tmp_path))
-        self._tap(callback_select_edit, self._pick(buttons, "Dentista"), tmp_path)
-        self._tap(callback_select_edit_field, "editfield:date", tmp_path)
+        fields = self._tap(callback_select_edit, self._pick(buttons, "Dentista"), tmp_path)
+        self._tap(callback_select_edit_field, self._buttons(fields)["Data"], tmp_path)
 
         reply = self._type("31/02/2026", tmp_path)
 
@@ -645,3 +680,176 @@ class TestEditarEExcluirEmQualquerAgenda:
         self._tap(callback_nl_confirm, self._buttons(confirm)["Confirmar"], tmp_path)
 
         assert [calendar for calendar, _body in self.google.created] == [self.FAMILIA]
+
+
+class TestEditarMaisCampos(CenarioAgendas):
+    def _open_field(self, summary: str, field_label: str, tmp_path) -> AsyncMock:
+        """Abre o /editar, escolhe o evento e o campo; devolve a resposta do bot."""
+        buttons = self._buttons(self._command(cmd_editar, tmp_path))
+        fields = self._tap(callback_select_edit, self._pick(buttons, summary), tmp_path)
+        return self._tap(callback_select_edit_field, self._buttons(fields)[field_label], tmp_path)
+
+    def test_menu_de_campos_de_evento_com_horario(self, tmp_path):
+        buttons = self._buttons(self._command(cmd_editar, tmp_path))
+
+        fields = self._tap(callback_select_edit, self._pick(buttons, "Jantar em família"), tmp_path)
+
+        assert list(self._buttons(fields)) == [
+            "Título", "Data", "Horário", "Duração", "Local", "Descrição", "Participantes", "Cancelar",
+        ]
+
+    def test_trocar_local(self, tmp_path):
+        self._open_field("Jantar em família", "Local", tmp_path)
+
+        reply = self._type("Casa da vovó", tmp_path)
+
+        assert self.google.updated[-1][2]["location"] == "Casa da vovó"
+        assert "Local atualizado" in reply.call_args.args[0]
+
+    def test_hifen_apaga_a_descricao(self, tmp_path):
+        self._open_field("Jantar em família", "Descrição", tmp_path)
+
+        reply = self._type("-", tmp_path)
+
+        assert self.google.updated[-1][2]["description"] == ""
+        assert "Descrição apagada" in reply.call_args.args[0]
+
+    def test_duracao_muda_o_fim(self, tmp_path):
+        self._open_field("Dentista", "Duração", tmp_path)
+
+        self._type("1h30", tmp_path)
+
+        assert self.google.updated[-1][2]["end"]["dateTime"] == "2026-10-09T21:30:00"
+
+    def test_duracao_invalida_explica_o_formato(self, tmp_path):
+        self._open_field("Dentista", "Duração", tmp_path)
+
+        reply = self._type("uma hora", tmp_path)
+
+        assert "1h30" in reply.call_args.args[0]
+        assert self.google.updated == []
+
+    def test_participantes_mostra_quem_ja_foi_convidado(self, tmp_path):
+        view = self._open_field("Jantar em família", "Participantes", tmp_path)
+
+        text = view.call_args.args[0]
+        assert "Mãe (mae@gmail.com): vai" in text
+        assert "joao@gmail.com: não respondeu" in text
+        assert self.EU not in text
+        assert list(self._buttons(view)) == ["❌ Mãe", "❌ joao@gmail.com", "Cancelar"]
+
+    def test_convidar_por_nome_pede_confirmacao_antes_do_email(self, tmp_path):
+        self._open_field("Dentista", "Participantes", tmp_path)
+
+        confirm = self._type("mãe e ana@exemplo.com", tmp_path)
+
+        assert "mae@gmail.com" in confirm.call_args.args[0]
+        assert "ana@exemplo.com" in confirm.call_args.args[0]
+        assert self.google.updated == []  # nada sai antes da confirmação
+
+        done = self._tap(callback_confirm_add_guests, self._buttons(confirm)["Confirmar convites"], tmp_path)
+
+        _calendar, _event, body = self.google.updated[-1]
+        assert [guest["email"] for guest in body["attendees"]] == ["mae@gmail.com", "ana@exemplo.com"]
+        assert self.google.update_options[-1]["sendUpdates"] == "all"
+        assert "✅" in done.call_args.args[0]
+
+    def test_quem_ja_esta_convidado_nao_e_convidado_de_novo(self, tmp_path):
+        # A confirmação dizia "convidar joao@gmail.com" para quem já estava na lista.
+        self._open_field("Jantar em família", "Participantes", tmp_path)
+
+        confirm = self._type("joao@gmail.com, ana, Ana Souza", tmp_path)
+
+        text = confirm.call_args.args[0]
+        assert text.count("ana@exemplo.com") == 1
+        assert "Já estava convidado: joao@gmail.com" in text
+        done = self._tap(callback_confirm_add_guests, self._buttons(confirm)["Confirmar convites"], tmp_path)
+        assert "joao" not in done.call_args.args[0]
+
+    def test_confirmacao_antiga_vale_so_para_o_evento_e_as_pessoas_que_mostrou(self, tmp_path):
+        # Regressão: com duas edições abertas, o botão do Dentista convidava
+        # para o Jantar, que a pessoa nunca confirmou.
+        self._open_field("Dentista", "Participantes", tmp_path)
+        confirm_dentista = self._type("ana@exemplo.com", tmp_path)
+        self._open_field("Jantar em família", "Participantes", tmp_path)
+        confirm_jantar = self._type("mae2@gmail.com", tmp_path)
+
+        self._tap(callback_confirm_add_guests, self._buttons(confirm_dentista)["Confirmar convites"], tmp_path)
+        self._tap(callback_confirm_add_guests, self._buttons(confirm_jantar)["Confirmar convites"], tmp_path)
+
+        invited = [
+            (event, [guest["email"] for guest in body["attendees"]][-1])
+            for _calendar, event, body in self.google.updated
+        ]
+        assert invited == [("dentista", "ana@exemplo.com"), ("jantar", "mae2@gmail.com")]
+
+    def test_botao_de_campo_de_menu_antigo_edita_o_evento_daquele_menu(self, tmp_path):
+        # Regressão: o "Título" do menu do Jantar, tocado depois de abrir o menu
+        # do Dentista, mudava o título do Dentista.
+        buttons = self._buttons(self._command(cmd_editar, tmp_path))
+        fields_jantar = self._tap(callback_select_edit, self._pick(buttons, "Jantar em família"), tmp_path)
+        buttons = self._buttons(self._command(cmd_editar, tmp_path))
+        self._tap(callback_select_edit, self._pick(buttons, "Dentista"), tmp_path)
+
+        prompt = self._tap(callback_select_edit_field, self._buttons(fields_jantar)["Título"], tmp_path)
+        self._type("Jantar na vovó", tmp_path)
+
+        assert "Jantar em família" in prompt.call_args.args[0]
+        assert [event for _calendar, event, _body in self.google.updated] == ["jantar"]
+
+    def test_escolher_outro_evento_nao_herda_o_campo_do_anterior(self, tmp_path):
+        self._open_field("Dentista", "Participantes", tmp_path)
+        buttons = self._buttons(self._command(cmd_editar, tmp_path))
+        self._tap(callback_select_edit, self._pick(buttons, "Jantar em família"), tmp_path)
+
+        with patch("src.telegram_bot.parse_intent", AsyncMock(return_value={"intent": "desconhecido"})):
+            reply = self._type("ana@exemplo.com", tmp_path)
+
+        assert "Convidar" not in reply.call_args.args[0]
+
+    def test_mudar_evento_com_convidados_avisa_antes_que_eles_recebem_email(self, tmp_path):
+        with_guests = self._open_field("Jantar em família", "Título", tmp_path)
+        without_guests = self._open_field("Dentista", "Título", tmp_path)
+
+        assert "convidados recebem um e-mail" in with_guests.call_args.args[0]
+        assert "convidados" not in without_guests.call_args.args[0]
+
+    def test_nome_ambiguo_nao_convida_e_deixa_digitar_de_novo(self, tmp_path):
+        self._open_field("Dentista", "Participantes", tmp_path)
+
+        reply = self._type("joão", tmp_path)
+        assert "jp@gmail.com" in reply.call_args.args[0]
+
+        confirm = self._type("joao@gmail.com", tmp_path)
+        assert "Confirmar convites" in self._buttons(confirm)
+        assert self.google.updated == []
+
+    def test_tirar_participante_pede_confirmacao(self, tmp_path):
+        view = self._open_field("Jantar em família", "Participantes", tmp_path)
+
+        ask = self._tap(callback_ask_remove_guest, self._buttons(view)["❌ joao@gmail.com"], tmp_path)
+        assert "joao@gmail.com" in ask.call_args.args[0]
+        assert self.google.updated == []
+
+        self._tap(callback_confirm_remove_guest, self._buttons(ask)["Sim, tirar"], tmp_path)
+
+        _calendar, _event, body = self.google.updated[-1]
+        assert "joao@gmail.com" not in [guest["email"] for guest in body["attendees"]]
+        assert self.google.update_options[-1]["sendUpdates"] == "all"
+
+    def test_cancelar_participantes_nao_manda_nada(self, tmp_path):
+        view = self._open_field("Jantar em família", "Participantes", tmp_path)
+
+        self._tap(callback_cancel_guests, self._buttons(view)["Cancelar"], tmp_path)
+
+        assert self.google.updated == []
+        assert "editing_field" not in self.context.user_data
+
+    def test_excluir_evento_com_convidados_avisa_que_eles_recebem_email(self, tmp_path):
+        buttons = self._buttons(self._command(cmd_excluir, tmp_path))
+        confirm = self._tap(callback_confirm_delete_event, self._pick(buttons, "Jantar em família"), tmp_path)
+        assert "convidados" in confirm.call_args.args[0]
+
+        self._tap(callback_delete_event, self._buttons(confirm)["Sim, excluir"], tmp_path)
+
+        assert self.google.delete_options[-1]["sendUpdates"] == "all"

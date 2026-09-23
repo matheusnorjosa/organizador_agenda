@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from typing import NamedTuple
 
@@ -17,11 +18,13 @@ from telegram.ext import (
 )
 
 from src.calendar_api import (
+    get_event,
     get_events,
     get_events_for_date,
     create_event,
     update_event,
     delete_event,
+    resolve_guests,
     format_event,
     format_event_short,
     format_events_by_period,
@@ -520,12 +523,17 @@ def _event_menu(context: ContextTypes.DEFAULT_TYPE, events: list[dict], action: 
     for event in events:
         raw_key = f"{event['_calendar_id']}\n{event['id']}".encode("utf-8")
         key = hashlib.sha256(raw_key).hexdigest()[:16]
+        organizer_here = event.get("organizer", {}).get("self", False)
         choices[key] = {
             "calendar_id": event["_calendar_id"],
             "event_id": event["id"],
             "summary": event.get("summary", "Sem título"),
             "calendar_name": event.get("_calendar_name"),
             "all_day": "dateTime" not in event["start"],
+            # Mudança em evento com convidados manda e-mail do Google para
+            # eles; o bot avisa antes. Na exclusão, só quando a pessoa organiza.
+            "has_guests": bool(_guests(event)),
+            "notifies_guests": organizer_here and bool(_guests(event)),
         }
         buttons.append([InlineKeyboardButton(_event_label(event), callback_data=f"{action}:{key}")])
     return InlineKeyboardMarkup(buttons)
@@ -536,6 +544,9 @@ def _chosen_event(context: ContextTypes.DEFAULT_TYPE, key: str) -> dict | None:
 
 
 async def _reply_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, events: list[dict], limit: int):
+    # Uma edição nova abandona a anterior: sem isso, o próximo texto digitado
+    # ainda iria para o campo do evento antigo.
+    _clear_guest_editing(context)
     editable = [event for event in events if _can_edit(event)]
     if not editable:
         await update.message.reply_text("Nenhum evento que você possa editar nos próximos 30 dias.")
@@ -580,19 +591,26 @@ async def callback_select_edit(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
 
-    chosen = _chosen_event(context, query.data.replace("edit:", "", 1))
+    key = query.data.replace("edit:", "", 1)
+    chosen = _chosen_event(context, key)
     if not chosen:
         await query.edit_message_text(MENU_EXPIRED_TEXT)
         return
     context.user_data["editing_event"] = chosen
+    # O campo escolhido para o evento anterior não vale para este.
+    context.user_data.pop("editing_field", None)
 
-    buttons = [
-        [InlineKeyboardButton("Título", callback_data="editfield:title")],
-        [InlineKeyboardButton("Data", callback_data="editfield:date")],
-    ]
-    # Evento de dia inteiro não tem horário para mudar.
+    def field_button(label: str, field: str) -> InlineKeyboardButton:
+        # O botão leva o evento do menu: com dois menus abertos, tocar no antigo
+        # edita o evento dele, e não o último escolhido.
+        return InlineKeyboardButton(label, callback_data=f"editfield:{field}:{key}")
+
+    buttons = [[field_button("Título", "title"), field_button("Data", "date")]]
+    # Evento de dia inteiro não tem horário nem duração em horas.
     if not chosen["all_day"]:
-        buttons.append([InlineKeyboardButton("Horário", callback_data="editfield:time")])
+        buttons.append([field_button("Horário", "time"), field_button("Duração", "duration")])
+    buttons.append([field_button("Local", "location"), field_button("Descrição", "description")])
+    buttons.append([field_button("Participantes", "attendees")])
     buttons.append([InlineKeyboardButton("Cancelar", callback_data="editfield:cancel")])
     await query.edit_message_text("O que deseja alterar?", reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -601,28 +619,57 @@ async def callback_select_edit_field(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer()
 
-    field = query.data.replace("editfield:", "", 1)
+    field, _separator, key = query.data.replace("editfield:", "", 1).partition(":")
 
     if field == "cancel":
         context.user_data.pop("editing_event", None)
         await query.edit_message_text("Edição cancelada.")
         return
 
+    editing = _chosen_event(context, key)
+    if not editing:
+        await query.edit_message_text(MENU_EXPIRED_TEXT)
+        return
+    context.user_data["editing_event"] = editing
     context.user_data["editing_field"] = field
+
+    if field == "attendees":
+        await _show_guests(query, context)
+        return
 
     prompts = {
         "title": "Digite o novo título:",
         "date": "Digite a nova data (dd/mm/aaaa):",
         "time": "Digite o novo horário (hh:mm):",
+        "duration": "Digite a nova duração (ex.: 1h, 1h30, 45min):",
+        "location": "Digite o novo local (ou - para apagar):",
+        "description": "Digite a nova descrição (ou - para apagar):",
     }
+    # O nome do evento no pedido deixa claro o que vai mudar.
+    prompt = f'✏️ {editing["summary"]}\n\n{prompts[field]}'
+    if editing["has_guests"]:
+        prompt += "\n\nOs convidados recebem um e-mail do Google avisando da mudança."
 
-    await query.edit_message_text(prompts[field])
+    await query.edit_message_text(prompt)
 
 
 EDIT_FORMAT_ERRORS = {
     "date": "Data inválida. Use dd/mm/aaaa e comece de novo com /editar.",
     "time": "Horário inválido. Use hh:mm e comece de novo com /editar.",
+    "duration": "Duração inválida. Use, por exemplo, 1h, 1h30 ou 45min, e comece de novo com /editar.",
 }
+
+EDIT_SUCCESS = {
+    "title": "Título atualizado",
+    "date": "Data atualizada",
+    "time": "Horário atualizado",
+    "duration": "Duração atualizada",
+    "location": "Local atualizado",
+    "description": "Descrição atualizada",
+}
+
+# Campos que aceitam "-" para ficar em branco.
+EDIT_CLEARED = {"location": "Local apagado.", "description": "Descrição apagada."}
 
 
 async def handle_edit_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -635,12 +682,21 @@ async def handle_edit_response(update: Update, context: ContextTypes.DEFAULT_TYP
         return False
 
     value = update.message.text.strip()
-    updates = {field: value}
+
+    if field == "attendees":
+        # O estado continua: se algum nome não der certo, a pessoa digita de novo.
+        await _prepare_invites(update, context, user_id, editing, value)
+        return True
+
+    clearing = field in EDIT_CLEARED and value == "-"
+    updates = {field: "" if clearing else value}
 
     try:
         update_event(user_id, editing["calendar_id"], editing["event_id"], updates)
-        field_names = {"title": "Título", "date": "Data", "time": "Horário"}
-        await update.message.reply_text(f"✅ {field_names[field]} atualizado para: {value}")
+        if clearing:
+            await update.message.reply_text(f"✅ {EDIT_CLEARED[field]}")
+        else:
+            await update.message.reply_text(f"✅ {EDIT_SUCCESS[field]} para: {value}")
     except ValueError:
         await update.message.reply_text(
             EDIT_FORMAT_ERRORS.get(field, "Valor inválido. Comece de novo com /editar.")
@@ -687,6 +743,8 @@ async def callback_confirm_delete_event(update: Update, context: ContextTypes.DE
             f"\n\nEle está na agenda {chosen['calendar_name']} e some para todos "
             "que usam essa agenda."
         )
+    if chosen["notifies_guests"]:
+        text += "\n\nOs convidados recebem um e-mail de cancelamento do Google."
 
     buttons = [
         [
@@ -724,6 +782,256 @@ async def callback_delete_event(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"Erro ao excluir evento para {user_id}: {e}")
         await query.edit_message_text("Erro ao excluir evento. Tente novamente.")
+
+
+# --- Participantes (/editar → Participantes) ---
+
+RESPONSE_LABELS = {
+    "accepted": "vai",
+    "declined": "não vai",
+    "tentative": "talvez",
+    "needsAction": "não respondeu",
+}
+
+
+def _guests(event: dict) -> list[dict]:
+    """Convidados de verdade: sem a própria pessoa e sem sala de reunião."""
+    return [
+        guest for guest in event.get("attendees", [])
+        if not guest.get("self") and not guest.get("resource")
+    ]
+
+
+def _person_label(name: str | None, email: str) -> str:
+    return f"{name} ({email})" if name else email
+
+
+def _guest_key(email: str) -> str:
+    # E-mail no botão pode passar dos 64 bytes do Telegram; vai só um resumo.
+    return hashlib.sha256(email.lower().encode("utf-8")).hexdigest()[:16]
+
+
+def _split_guest_entries(text: str) -> list[str]:
+    # "mãe e João, ana@x.com" vira ["mãe", "João", "ana@x.com"].
+    return [part.strip() for part in re.split(r",|;|\s+e\s+", text) if part.strip()]
+
+
+def _clear_guest_editing(context: ContextTypes.DEFAULT_TYPE):
+    for key in ("editing_event", "editing_field"):
+        context.user_data.pop(key, None)
+
+
+async def _show_guests(query, context: ContextTypes.DEFAULT_TYPE):
+    editing = context.user_data.get("editing_event")
+    user_id = get_user_id(query.from_user.id)
+    if not editing or not user_id:
+        await query.edit_message_text(MENU_EXPIRED_TEXT)
+        return
+
+    try:
+        guests = _guests(get_event(user_id, editing["calendar_id"], editing["event_id"]))
+    except Exception as e:
+        logger.error(f"Erro ao buscar participantes para {user_id}: {e}")
+        _clear_guest_editing(context)
+        await query.edit_message_text("Erro ao acessar a agenda. Tente novamente.")
+        return
+
+    lines = [f'👥 Participantes de "{editing["summary"]}"', ""]
+    for guest in guests:
+        answer = RESPONSE_LABELS.get(guest.get("responseStatus", ""), "não respondeu")
+        lines.append(f"• {_person_label(guest.get('displayName'), guest['email'])}: {answer}")
+    if not guests:
+        lines.append("Ninguém foi convidado ainda.")
+    lines += ["", "Para convidar, digite nomes de contatos ou e-mails, separados por vírgula."]
+    if guests:
+        lines.append("Para tirar alguém, toque no nome.")
+
+    buttons = [
+        [InlineKeyboardButton(
+            f"❌ {guest.get('displayName') or guest['email']}",
+            callback_data=f"guestrm:{_guest_key(guest['email'])}",
+        )]
+        for guest in guests
+    ]
+    buttons.append([InlineKeyboardButton("Cancelar", callback_data="guests_cancel")])
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def _prepare_invites(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, editing: dict, text: str):
+    """Resolve os nomes e pede confirmação. Nenhum convite sai daqui."""
+    cancel = InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="guests_cancel")]])
+    entries = _split_guest_entries(text)
+    if not entries:
+        await update.message.reply_text("Digite pelo menos um nome ou e-mail.", reply_markup=cancel)
+        return
+
+    try:
+        guests, problems = resolve_guests(user_id, entries)
+    except Exception as e:
+        logger.error(f"Erro ao ler os contatos de {user_id}: {e}")
+        await update.message.reply_text(
+            "Não consegui ler seus contatos agora. Digite os e-mails, separados por vírgula.",
+            reply_markup=cancel,
+        )
+        return
+
+    if problems:
+        await update.message.reply_text(
+            "\n".join(problems) + "\n\nDigite de novo a lista toda, ou toque em Cancelar.",
+            reply_markup=cancel,
+        )
+        return
+
+    try:
+        event = get_event(user_id, editing["calendar_id"], editing["event_id"])
+    except Exception as e:
+        logger.error(f"Erro ao buscar participantes para {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar a agenda. Tente novamente.", reply_markup=cancel)
+        return
+
+    # Quem já está na lista não recebe convite de novo; e a mesma pessoa
+    # digitada duas vezes ("mãe, mae@gmail.com") conta uma vez só.
+    seen = {guest["email"].lower() for guest in _guests(event)}
+    already = [guest for guest in guests if guest["email"].lower() in seen]
+    new_guests = []
+    for guest in guests:
+        if guest["email"].lower() not in seen:
+            seen.add(guest["email"].lower())
+            new_guests.append(guest)
+
+    if not new_guests:
+        await update.message.reply_text("Essas pessoas já estão convidadas.", reply_markup=cancel)
+        return
+
+    # O botão de confirmar aponta para este convite exato (evento + pessoas).
+    # Com duas edições abertas, um botão antigo não pode confirmar a outra.
+    raw_key = "\n".join(
+        [editing["calendar_id"], editing["event_id"], *sorted(guest["email"].lower() for guest in new_guests)]
+    ).encode("utf-8")
+    invite_key = hashlib.sha256(raw_key).hexdigest()[:16]
+    context.user_data.setdefault("pending_invites", {})[invite_key] = {
+        "calendar_id": editing["calendar_id"],
+        "event_id": editing["event_id"],
+        "guests": new_guests,
+    }
+
+    lines = [f'Convidar para "{editing["summary"]}":']
+    lines += [f"• {_person_label(guest['name'], guest['email'])}" for guest in new_guests]
+    if already:
+        lines.append("")
+        lines += [f"Já estava convidado: {_person_label(guest['name'], guest['email'])}" for guest in already]
+    lines += ["", "Cada pessoa recebe um convite por e-mail do Google."]
+    buttons = [[
+        InlineKeyboardButton("Confirmar convites", callback_data=f"guestadd_ok:{invite_key}"),
+        InlineKeyboardButton("Cancelar", callback_data="guests_cancel"),
+    ]]
+    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def callback_confirm_add_guests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    invite_key = query.data.replace("guestadd_ok:", "", 1)
+    invite = context.user_data.get("pending_invites", {}).pop(invite_key, None)
+    user_id = get_user_id(query.from_user.id)
+    if not invite or not user_id:
+        # Também é o segundo toque no mesmo botão: o convite já saiu no primeiro.
+        await query.edit_message_text("Esse convite já foi enviado ou expirou. Nada foi feito agora.")
+        return
+
+    # Só encerra a edição em curso se ela é deste mesmo evento.
+    editing = context.user_data.get("editing_event") or {}
+    if (editing.get("calendar_id"), editing.get("event_id")) == (invite["calendar_id"], invite["event_id"]):
+        _clear_guest_editing(context)
+
+    guests = invite["guests"]
+    emails = [guest["email"] for guest in guests]
+    try:
+        update_event(user_id, invite["calendar_id"], invite["event_id"], {"add_attendees": emails})
+    except Exception as e:
+        logger.error(f"Erro ao convidar para evento de {user_id}: {e}")
+        await query.edit_message_text("O Google não aceitou os convites. Ninguém foi convidado.")
+        return
+
+    # Só a contagem: e-mail de convidado não vai para o log.
+    logger.info(f"{user_id} convidou {len(guests)} pessoa(s) para um evento")
+    names = ", ".join(guest["name"] or guest["email"] for guest in guests)
+    await query.edit_message_text(f"✅ Convite enviado para: {names}.")
+
+
+async def _find_guest(query, context: ContextTypes.DEFAULT_TYPE, key: str) -> tuple[str, dict, dict] | None:
+    """Relê o evento, porque o botão pode ser de uma lista antiga.
+
+    Devolve None quando já respondeu ao usuário.
+    """
+    editing = context.user_data.get("editing_event")
+    user_id = get_user_id(query.from_user.id)
+    if not editing or not user_id:
+        await query.edit_message_text(MENU_EXPIRED_TEXT)
+        return None
+
+    try:
+        event = get_event(user_id, editing["calendar_id"], editing["event_id"])
+    except Exception as e:
+        logger.error(f"Erro ao buscar participantes para {user_id}: {e}")
+        await query.edit_message_text("Erro ao acessar a agenda. Tente novamente.")
+        return None
+
+    guest = next((guest for guest in _guests(event) if _guest_key(guest["email"]) == key), None)
+    if guest is None:
+        await query.edit_message_text("Essa pessoa não está mais no evento.")
+        return None
+    return user_id, editing, guest
+
+
+async def callback_ask_remove_guest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    key = query.data.replace("guestrm:", "", 1)
+    found = await _find_guest(query, context, key)
+    if found is None:
+        return
+    _user_id, editing, guest = found
+
+    text = (
+        f'Tirar {_person_label(guest.get("displayName"), guest["email"])} de "{editing["summary"]}"?\n\n'
+        "A pessoa recebe um aviso do Google de que não está mais convidada."
+    )
+    buttons = [[
+        InlineKeyboardButton("Sim, tirar", callback_data=f"guestrm_ok:{key}"),
+        InlineKeyboardButton("Cancelar", callback_data="guests_cancel"),
+    ]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def callback_confirm_remove_guest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    found = await _find_guest(query, context, query.data.replace("guestrm_ok:", "", 1))
+    if found is None:
+        return
+    user_id, editing, guest = found
+    _clear_guest_editing(context)
+
+    try:
+        update_event(user_id, editing["calendar_id"], editing["event_id"], {"remove_attendees": [guest["email"]]})
+    except Exception as e:
+        logger.error(f"Erro ao tirar participante de evento de {user_id}: {e}")
+        await query.edit_message_text("O Google não aceitou a mudança. A pessoa continua convidada.")
+        return
+
+    logger.info(f"{user_id} tirou 1 pessoa de um evento")
+    await query.edit_message_text(f"✅ {guest.get('displayName') or guest['email']} saiu do evento.")
+
+
+async def callback_cancel_guests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _clear_guest_editing(context)
+    await query.edit_message_text("Nada foi alterado.")
 
 
 # --- /livre ---
@@ -1900,6 +2208,10 @@ def create_bot(token: str) -> Application:
     app.add_handler(CallbackQueryHandler(callback_confirm_delete_task, pattern=r"^confirmdeltask:"))
     app.add_handler(CallbackQueryHandler(callback_delete_task, pattern=r"^deltask:"))
     app.add_handler(CallbackQueryHandler(callback_toggle_calendar, pattern=r"^agenda:"))
+    app.add_handler(CallbackQueryHandler(callback_cancel_guests, pattern=r"^guests_cancel$"))
+    app.add_handler(CallbackQueryHandler(callback_confirm_add_guests, pattern=r"^guestadd_ok:"))
+    app.add_handler(CallbackQueryHandler(callback_ask_remove_guest, pattern=r"^guestrm:"))
+    app.add_handler(CallbackQueryHandler(callback_confirm_remove_guest, pattern=r"^guestrm_ok:"))
     app.add_handler(CallbackQueryHandler(callback_warn_calendar_removal, pattern=r"^rmagenda:"))
     app.add_handler(CallbackQueryHandler(callback_confirm_calendar_removal, pattern=r"^rmagenda_ok:"))
     app.add_handler(CallbackQueryHandler(callback_cancel_calendar_removal, pattern=r"^rmagenda_cancel$"))
