@@ -11,7 +11,8 @@ já disparou às 4h da manhã por causa disso.
 Skills do projeto (em `.claude/skills/`), carregar conforme a tarefa:
 - `fuso-horario` — qualquer coisa com data, hora, lembrete ou agendamento
 - `notificacoes` — mexer no laço de avisos (`src/agent.py`)
-- `deploy` — publicar em produção (o deploy **não** dispara sozinho após o merge)
+- `deploy` — publicar em produção (o merge dispara o deploy sozinho enquanto o PAT do auto-merge
+  vale; conferir sempre o log, não só o status)
 
 Agentes disponíveis: `revisor-agenda` (revisa contra as armadilhas conhecidas) e
 `simulador-notificacao` (executa um cenário e mostra a mensagem que o bot enviaria).

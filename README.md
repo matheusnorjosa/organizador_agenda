@@ -25,8 +25,9 @@ Bot do Telegram que integra Google Calendar, Google Tasks e Google Contacts para
 
 ### Casal
 - Agenda compartilhada do casal lado a lado
-- Detecção automática de conflitos de horário — ignora o mesmo evento visto nas duas
-  agendas compartilhadas e os compromissos da agenda conjunta `Família`
+- Detecção automática de conflitos de horário: avisa quando alguém ficaria em dois
+  compromissos ao mesmo tempo, inclusive um da agenda conjunta `Família` com um individual.
+  Cada um com o seu compromisso não é conflito
 - Criar evento nas agendas de todos os usuários
 
 ### Outros

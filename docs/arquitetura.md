@@ -21,7 +21,7 @@ Roda em **container Docker numa VM Oracle**. O processo é único e tem duas par
 | `src/natural_language.py` | Interpreta texto livre via API da Groq (Llama) e devolve intenção/evento em JSON. |
 | `src/auth.py` | Autenticação Google local (`python -m src.auth <nome>`). No dia a dia usa-se `/auth` no Telegram. |
 
-Estado que não está no código: `tokens/` (credenciais OAuth por usuário) e `users.json` (mapa telegram_id → nome). Ambos fora do versionamento, montados como volume no container.
+Estado que não está no código: `tokens/` (credenciais OAuth por usuário), `users.json` (mapa telegram_id → nome, e o `/silencio`) e `estado/` (marco de eventos novos e agendas ocultas). Todos ficam fora do versionamento e são montados como volume no container.
 
 ## Fuso horário — a regra mais importante
 
@@ -197,6 +197,27 @@ Para provar que um teste de regressão realmente pega o bug, rodá-lo contra o c
 
 ## Deploy
 
-Ver `.claude/skills/deploy/SKILL.md`. Resumo: PR → auto-merge (squash) → **disparar o deploy à mão** com `gh workflow run deploy.yml`, porque merges feitos pelo `GITHUB_TOKEN` não disparam workflows.
+Ver `.claude/skills/deploy/SKILL.md`. Resumo: PR → auto-merge (squash) → o merge dispara o deploy sozinho, porque o auto-merge usa o `AUTO_MERGE_PAT`. O PAT expira em **22/11/2026** (`docs/setup_pat.md`). Sem ele, o deploy volta a exigir `gh workflow run deploy.yml`. Conferir sempre o log do deploy, e não só o status.
 
 O `Dockerfile` copia apenas `src/` e `requirements.txt` — mudança só em `docs/`, `tests/` ou `.claude/` não exige deploy.
+
+## Logs e segredos
+
+O repositório é público, e o deploy imprime as últimas linhas do log do container no GitHub Actions. Tudo o que o bot registra pode ficar visível para qualquer pessoa.
+
+- **Nunca registrar segredo.** Em 2026-09 o token do bot apareceu em logs de deploy: o `httpx` registrava cada requisição em INFO, e o endereço das chamadas ao Telegram contém o token. Hoje o logger `httpx` fica em WARNING (`src/agent.py`), com teste. O token foi trocado, e o passo a passo está em `docs/setup_telegram.md`.
+- **Não registrar e-mail de convidado nem nome de contato.** Os logs de participantes guardam só a quantidade.
+- **Conferir o log do deploy também por segredo:** `gh run view <id> --log | grep -c "api.telegram.org/bot[0-9]"` deve dar 0.
+
+## Limitações conhecidas
+
+O que o bot não faz, ou faz de um jeito que pode surpreender.
+
+| Limitação | Efeito |
+|---|---|
+| Menus e confirmações ficam na memória do bot | Depois de um deploy, o botão de um menu antigo avisa que expirou |
+| Evento que se repete | Editar ou excluir vale só para aquela ocorrência |
+| Texto livre não gerencia agendas | Ocultar e remover agenda só pelos comandos `/agendas` e `/remover_agenda` |
+| Sem paginação nas buscas do Google | Até 100 agendas, 250 eventos por agenda em cada busca e 1000 contatos. Para um casal, sobra |
+| Erro do Google vai para o log com o texto original | O texto pode trazer o ID da agenda, que às vezes é um e-mail |
+| Log do deploy é público | Qualquer log novo com dado sensível ficaria exposto. O deploy imprime `docker logs --tail 5` (30 em falha) |
