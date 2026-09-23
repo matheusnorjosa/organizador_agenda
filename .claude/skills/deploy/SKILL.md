@@ -42,12 +42,14 @@ Em 2026-07-30 descobrimos que a produção estava **6 dias parada** enquanto tr�
 O script agora usa `set -euo pipefail` + `git fetch && git reset --hard origin/main` e verifica se o container ficou de pé. Mas a lição vale para qualquer suspeita de "corrigi e continua errado":
 
 ```bash
-gh run view <run-id> --log | grep -iE "Updating|Fast-forward|error:|Aborting|COPY src"
+gh run view <run-id> --log | grep -iE "HEAD is now at|error:|Aborting|COPY src|Container no ar"
+gh run view <run-id> --log | grep -c "api.telegram.org/bot[0-9]"   # tem que dar 0
 ```
 
-- `Fast-forward` ou `Updating a..b` sem erro = código novo entrou
+- `HEAD is now at <sha>` = código novo entrou (o deploy usa `git reset --hard`)
 - `Aborting` = **não entrou**, mesmo com o job verde
 - `COPY src/ src/ ---> Using cache` = o código-fonte não mudou nessa build
+- Contagem diferente de 0 na segunda linha = **o token do bot está no log público**. Ver "Logs e segredos" em `docs/arquitetura.md`
 
 Se o usuário disser que a correção não surtiu efeito, **cheque isto antes de duvidar do código**.
 
