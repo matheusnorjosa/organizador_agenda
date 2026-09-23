@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -28,6 +29,9 @@ from src.calendar_api import (
     get_free_slots,
     get_upcoming_birthdays,
     list_calendars,
+    list_all_calendars,
+    get_hidden_calendars,
+    set_calendar_hidden,
     is_user_authenticated,
     generate_auth_url,
     complete_auth,
@@ -160,6 +164,7 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 *Comandos disponíveis:*\n\n"
         "*Agenda:*\n"
         "/auth — Cadastra e conecta sua conta Google\n"
+        "/agendas — Escolhe quais agendas aparecem no bot\n"
         "/hoje — Eventos de hoje\n"
         "/amanha — Eventos de amanhã\n"
         "/eventos — Próximos 7 dias\n"
@@ -1220,6 +1225,107 @@ async def cmd_ativar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔔 Lembretes reativados!")
 
 
+# --- /agendas ---
+
+AGENDAS_TEXT = (
+    "📅 *Suas agendas*\n\n"
+    "Toque numa agenda para esconder ou mostrar os eventos dela aqui no bot. "
+    "Nada muda no Google Agenda.\n\n"
+    "A agenda principal sempre aparece."
+)
+
+
+def _calendar_button_data(calendar_id: str) -> str:
+    # O Telegram aceita no máximo 64 bytes por botão, e o ID das agendas
+    # criadas hoje no Google passa disso. O resumo do ID cabe e continua
+    # valendo depois de um reinício do bot.
+    return "agenda:" + hashlib.sha256(calendar_id.encode("utf-8")).hexdigest()[:16]
+
+
+def _calendar_visibility_keyboard(calendars: list[dict], hidden: set[str]) -> InlineKeyboardMarkup:
+    buttons = []
+    for cal in calendars:
+        # Sem a principal, somem os compromissos da própria pessoa e o alerta
+        # de conflito perde como saber de quem é cada evento.
+        if cal["primary"]:
+            continue
+        if cal["id"] in hidden:
+            label = f"🚫 {cal['name']} (oculta)"
+        else:
+            label = f"✅ {cal['name']}"
+        buttons.append(
+            [InlineKeyboardButton(label, callback_data=_calendar_button_data(cal["id"]))]
+        )
+    return InlineKeyboardMarkup(buttons)
+
+
+async def cmd_agendas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = await check_user(update)
+    if not user_id:
+        return
+
+    try:
+        calendars = list_all_calendars(user_id)
+    except Exception as e:
+        logger.error(f"Erro ao listar agendas de {user_id}: {e}")
+        await update.message.reply_text("Erro ao acessar suas agendas. Tente novamente.")
+        return
+
+    if all(cal["primary"] for cal in calendars):
+        await update.message.reply_text(
+            "Você só tem a agenda principal, e ela sempre aparece no bot."
+        )
+        return
+
+    await update.message.reply_text(
+        AGENDAS_TEXT,
+        reply_markup=_calendar_visibility_keyboard(calendars, get_hidden_calendars(user_id)),
+        parse_mode="Markdown",
+    )
+
+
+async def callback_toggle_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = get_user_id(query.from_user.id)
+    if not user_id:
+        await query.edit_message_text("Erro: usuário não encontrado.")
+        return
+
+    try:
+        calendars = list_all_calendars(user_id)
+    except Exception as e:
+        logger.error(f"Erro ao listar agendas de {user_id}: {e}")
+        await query.edit_message_text("Erro ao acessar suas agendas. Tente novamente.")
+        return
+
+    calendar = next(
+        (cal for cal in calendars if _calendar_button_data(cal["id"]) == query.data),
+        None,
+    )
+    if calendar is None:
+        await query.edit_message_text(
+            "Essa agenda não está mais na sua conta Google. Use /agendas de novo."
+        )
+        return
+
+    hide = calendar["id"] not in get_hidden_calendars(user_id)
+    try:
+        set_calendar_hidden(user_id, calendar["id"], hide)
+    except OSError as e:
+        logger.error(f"Erro ao salvar agendas ocultas de {user_id}: {e}")
+        await query.edit_message_text("Não consegui salvar a escolha. Tente novamente.")
+        return
+
+    action = "ocultou" if hide else "voltou a mostrar"
+    logger.info(f"{user_id} {action} a agenda {calendar['name']}")
+
+    await query.edit_message_reply_markup(
+        reply_markup=_calendar_visibility_keyboard(calendars, get_hidden_calendars(user_id))
+    )
+
+
 # --- Handler de texto livre (linguagem natural) ---
 
 async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1550,6 +1656,7 @@ def create_bot(token: str) -> Application:
     app.add_handler(CommandHandler("excluir_tarefa", cmd_excluir_tarefa))
     app.add_handler(CommandHandler("silencio", cmd_silencio))
     app.add_handler(CommandHandler("ativar", cmd_ativar))
+    app.add_handler(CommandHandler("agendas", cmd_agendas))
     app.add_handler(CallbackQueryHandler(callback_select_calendar, pattern=r"^cal:"))
     app.add_handler(CallbackQueryHandler(callback_confirm_delete_event, pattern=r"^confirmdel:"))
     app.add_handler(CallbackQueryHandler(callback_delete_event, pattern=r"^del:"))
@@ -1560,6 +1667,7 @@ def create_bot(token: str) -> Application:
     app.add_handler(CallbackQueryHandler(callback_complete_task, pattern=r"^done:"))
     app.add_handler(CallbackQueryHandler(callback_confirm_delete_task, pattern=r"^confirmdeltask:"))
     app.add_handler(CallbackQueryHandler(callback_delete_task, pattern=r"^deltask:"))
+    app.add_handler(CallbackQueryHandler(callback_toggle_calendar, pattern=r"^agenda:"))
     # Handler de texto livre: edição + linguagem natural
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))
 

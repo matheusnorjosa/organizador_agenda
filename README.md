@@ -14,6 +14,7 @@ Bot do Telegram que integra Google Calendar, Google Tasks e Google Contacts para
 - Eventos recorrentes (diário, semanal, quinzenal, mensal)
 - Seleção de agenda ao criar eventos (quando há múltiplas)
 - Busca eventos de todas as agendas (próprias, compartilhadas e inscritas)
+- Oculta do bot as agendas que não interessam; cada pessoa escolhe as suas (`/agendas`)
 - Visualização de horários livres do dia
 
 ### Tarefas
@@ -64,6 +65,7 @@ compartilhadas: [docs/arquitetura.md](docs/arquitetura.md).
 |---------|-----------|
 | `/start` | Boas-vindas e introdução ao bot |
 | `/auth` | Cadastra e conecta conta Google |
+| `/agendas` | Escolhe quais agendas aparecem no bot |
 | `/hoje` | Eventos de hoje por período |
 | `/amanha` | Eventos de amanhã |
 | `/eventos` | Próximos 7 dias |

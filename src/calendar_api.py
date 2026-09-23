@@ -21,6 +21,11 @@ SCOPES = [
 ]
 TOKENS_DIR = os.path.join(os.path.dirname(__file__), "..", "tokens")
 CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "..", "credentials.json")
+# Escolhas do /agendas. Fica no volume de estado: o container é recriado a
+# cada deploy e perderia o arquivo de outra forma.
+HIDDEN_CALENDARS_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "estado", "agendas_ocultas.json"
+)
 CALLBACK_PORT = 8095
 REDIRECT_URI_LOCAL = f"http://localhost:{CALLBACK_PORT}"
 REDIRECT_URI_REMOTE = "http://localhost:1"
@@ -217,15 +222,50 @@ def list_all_calendars(user_id: str) -> list[dict]:
     ]
 
 
+def _load_hidden_calendars() -> dict[str, list[str]]:
+    try:
+        with open(HIDDEN_CALENDARS_PATH, "r", encoding="utf-8") as state_file:
+            return json.load(state_file)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        # Toda busca de eventos passa por aqui: falhar pararia lembretes e
+        # resumos. Mostrar uma agenda a mais é o mal menor.
+        logger.error(f"Não foi possível ler as agendas ocultas: {e}")
+        return {}
+
+
+def get_hidden_calendars(user_id: str) -> set[str]:
+    """Agendas que o usuário escondeu do bot. Cada pessoa tem a sua lista."""
+    return set(_load_hidden_calendars().get(user_id, []))
+
+
+def set_calendar_hidden(user_id: str, calendar_id: str, hidden: bool):
+    hidden_by_user = _load_hidden_calendars()
+    user_hidden = set(hidden_by_user.get(user_id, []))
+    if hidden:
+        user_hidden.add(calendar_id)
+    else:
+        user_hidden.discard(calendar_id)
+    hidden_by_user[user_id] = sorted(user_hidden)
+
+    os.makedirs(os.path.dirname(HIDDEN_CALENDARS_PATH), exist_ok=True)
+    with open(HIDDEN_CALENDARS_PATH, "w", encoding="utf-8") as state_file:
+        json.dump(hidden_by_user, state_file, indent=2, ensure_ascii=False)
+
+
 def _fetch_events_from_all_calendars(
     user_id: str, time_min: str, time_max: str,
 ) -> list[dict]:
-    """Busca eventos de todas as agendas do usuário."""
+    """Busca eventos de todas as agendas do usuário, menos as que ele ocultou."""
     service = get_calendar_service(user_id)
     calendars = list_all_calendars(user_id)
+    hidden = get_hidden_calendars(user_id)
 
     all_events = []
     for cal in calendars:
+        if cal["id"] in hidden:
+            continue
         try:
             # Agendas compartilhadas podem usar outro fuso (ex: UTC);
             # pede a resposta já convertida para o fuso configurado.
