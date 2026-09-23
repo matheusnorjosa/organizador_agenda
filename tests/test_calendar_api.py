@@ -15,6 +15,7 @@ from src.calendar_api import (
     _get_period,
     _calendar_tag,
     set_calendar_hidden,
+    update_event,
     RECURRENCE_MAP,
 )
 
@@ -339,6 +340,56 @@ class TestAgendasOcultas:
         hidden_file.write_text("{isso não é json", encoding="utf-8")
 
         assert self._fetch_summaries("matheus", str(hidden_file)) == ["Dentista", "Feriado"]
+
+
+class TestUpdateEvent:
+    FAMILIA = "familia@group.calendar.google.com"
+
+    def _update(self, event: dict, updates: dict) -> dict:
+        """Aplica a edição e devolve o corpo que seria enviado ao Google."""
+        service = MagicMock()
+        service.events.return_value.get.return_value.execute.return_value = event
+        with patch("src.calendar_api.get_calendar_service", return_value=service):
+            update_event("matheus", self.FAMILIA, "jantar", updates)
+
+        get_kwargs = service.events.return_value.get.call_args.kwargs
+        update_kwargs = service.events.return_value.update.call_args.kwargs
+        assert get_kwargs["calendarId"] == update_kwargs["calendarId"] == self.FAMILIA
+        return update_kwargs["body"]
+
+    # Regressão: agenda compartilhada pode devolver o horário em UTC. O jantar
+    # de 09/10 às 22h de Fortaleza chega como 01h de 10/10, e a data ou o
+    # horário antigo eram lidos nesse fuso.
+    JANTAR_EM_UTC = {
+        "summary": "Jantar",
+        "start": {"dateTime": "2026-10-10T01:00:00Z"},
+        "end": {"dateTime": "2026-10-10T02:30:00Z"},
+    }
+
+    def test_mudar_horario_mantem_a_data_local(self):
+        body = self._update(dict(self.JANTAR_EM_UTC), {"time": "21:00"})
+
+        assert body["start"] == {"dateTime": "2026-10-09T21:00:00", "timeZone": "America/Fortaleza"}
+        assert body["end"] == {"dateTime": "2026-10-09T22:30:00", "timeZone": "America/Fortaleza"}
+
+    def test_mudar_data_mantem_o_horario_local(self):
+        body = self._update(dict(self.JANTAR_EM_UTC), {"date": "15/10/2026"})
+
+        assert body["start"]["dateTime"] == "2026-10-15T22:00:00"
+        assert body["end"]["dateTime"] == "2026-10-15T23:30:00"
+
+    def test_mudar_data_de_evento_de_dia_inteiro_mantem_os_dias(self):
+        # Regressão: evento de dia inteiro não tem "dateTime" e a edição quebrava.
+        viagem = {
+            "summary": "Viagem",
+            "start": {"date": "2026-10-10"},
+            "end": {"date": "2026-10-13"},
+        }
+
+        body = self._update(viagem, {"date": "20/10/2026"})
+
+        assert body["start"] == {"date": "2026-10-20"}
+        assert body["end"] == {"date": "2026-10-23"}
 
 
 class TestEventosDeVariosDias:

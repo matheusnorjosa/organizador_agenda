@@ -44,6 +44,7 @@ Camadas de proteção já existentes:
 | Leitura da API | `events().list(timeZone=...)` — o Google já devolve no fuso configurado |
 | Exibição | `_parse_event_datetime()` converte antes de formatar (cinto e suspensório) |
 | Escrita | `create_event`/`update_event` enviam `timeZone` explícito |
+| Edição | `update_event` converte o horário que veio do Google antes de trocar só a data ou só a hora |
 | Logs do container | `ENV TZ=America/Fortaleza` no `Dockerfile` |
 
 O fuso vem de `TIMEZONE` no `.env`; o padrão no código é `America/Fortaleza`.
@@ -127,6 +128,20 @@ O modelo é: **cada evento prende um conjunto de pessoas**, e há conflito quand
 A mensagem informa **quem** fica preso e a **janela de sobreposição**, não o horário de início solto: `• 31/07 15:00 às 16:00 — matheus: Dentista × Reunião`.
 
 > Compromisso de agenda secundária (ex.: uma agenda "Trabalho" só do Matheus) não entra na checagem, porque não dá para atribuir dono com segurança. A escolha é conservadora de propósito: erra para menos ruído.
+
+### Editar e excluir eventos
+
+Cada evento da lista carrega a agenda de onde veio (`_calendar_id`) e o acesso da pessoa a ela (`_calendar_access`). A edição e a exclusão usam essa agenda. Antes elas sempre miravam a principal, e evento da `Família` falhava com erro genérico.
+
+| O menu mostra | Regra |
+|---|---|
+| `/excluir` | Eventos de agendas em que a pessoa escreve (`owner`/`writer`) |
+| `/editar` | Os mesmos, menos convites de outra pessoa: só quem organiza (`organizer.self`) muda título e horário, salvo `guestsCanModify` |
+
+- **O botão leva um resumo de agenda + evento**, e o par fica em `context.user_data["event_choices"]`. Um ID de evento importado passa sozinho dos 64 bytes. Depois de um reinício do bot, o menu antigo avisa que expirou.
+- **O botão mostra a agenda** (`Churrasco [Família]`). O mesmo compromisso pode vir de duas agendas, o original e a cópia do convite, e excluir cada um faz uma coisa diferente.
+- **Evento de dia inteiro** não oferece "Horário". Trocar a data mantém a quantidade de dias (o fim é exclusivo no Google).
+- Evento que se repete: a mudança vale só para aquela ocorrência (a lista usa `singleEvents=True`).
 
 ### Agendas ocultas (`/agendas`)
 

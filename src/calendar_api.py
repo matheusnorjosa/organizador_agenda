@@ -338,6 +338,10 @@ def _fetch_events_from_all_calendars(
             ).execute()
 
             for event in result.get("items", []):
+                # Editar e excluir precisam saber em qual agenda o evento está
+                # e se a pessoa pode escrever nela.
+                event["_calendar_id"] = cal["id"]
+                event["_calendar_access"] = cal["access"]
                 if not cal["primary"]:
                     event["_calendar_name"] = cal["name"]
                 all_events.append(event)
@@ -428,54 +432,56 @@ def create_event(
     return created
 
 
-def update_event(user_id: str, event_id: str, updates: dict) -> dict:
+def update_event(user_id: str, calendar_id: str, event_id: str, updates: dict) -> dict:
     service = get_calendar_service(user_id)
-    event = service.events().get(calendarId="primary", eventId=event_id).execute()
-
-    timezone = str(get_timezone())
+    event = service.events().get(calendarId=calendar_id, eventId=event_id).execute()
 
     if "title" in updates:
         event["summary"] = updates["title"]
 
-    if "date" in updates and "time" in updates:
-        start_dt = datetime.strptime(f"{updates['date']} {updates['time']}", "%d/%m/%Y %H:%M")
-        old_start = datetime.fromisoformat(event["start"]["dateTime"])
-        old_end = datetime.fromisoformat(event["end"]["dateTime"])
-        duration = old_end - old_start
-        end_dt = start_dt + duration
+    if "date" in updates or "time" in updates:
+        if "dateTime" in event["start"]:
+            _reschedule_timed_event(event, updates)
+        else:
+            _move_all_day_event(event, updates)
 
-        event["start"] = {"dateTime": start_dt.isoformat(), "timeZone": timezone}
-        event["end"] = {"dateTime": end_dt.isoformat(), "timeZone": timezone}
+    return service.events().update(calendarId=calendar_id, eventId=event_id, body=event).execute()
 
-    elif "date" in updates:
-        old_start = datetime.fromisoformat(event["start"]["dateTime"])
-        old_end = datetime.fromisoformat(event["end"]["dateTime"])
-        duration = old_end - old_start
+
+def _reschedule_timed_event(event: dict, updates: dict):
+    # Agenda compartilhada pode devolver o horário em outro fuso (ex.: UTC).
+    # Sem converter, a data e a hora antigas seriam lidas nesse fuso.
+    old_start = _parse_event_datetime(event["start"]["dateTime"])
+    old_end = _parse_event_datetime(event["end"]["dateTime"])
+
+    new_date = old_start.date()
+    if "date" in updates:
         new_date = datetime.strptime(updates["date"], "%d/%m/%Y").date()
-        start_dt = datetime.combine(new_date, old_start.time())
-        end_dt = start_dt + duration
-
-        event["start"] = {"dateTime": start_dt.isoformat(), "timeZone": timezone}
-        event["end"] = {"dateTime": end_dt.isoformat(), "timeZone": timezone}
-
-    elif "time" in updates:
-        old_start = datetime.fromisoformat(event["start"]["dateTime"])
-        old_end = datetime.fromisoformat(event["end"]["dateTime"])
-        duration = old_end - old_start
+    new_time = old_start.time()
+    if "time" in updates:
         new_time = datetime.strptime(updates["time"], "%H:%M").time()
-        start_dt = datetime.combine(old_start.date(), new_time)
-        end_dt = start_dt + duration
 
-        event["start"] = {"dateTime": start_dt.isoformat(), "timeZone": timezone}
-        event["end"] = {"dateTime": end_dt.isoformat(), "timeZone": timezone}
-
-    updated = service.events().update(calendarId="primary", eventId=event_id, body=event).execute()
-    return updated
+    start_dt = datetime.combine(new_date, new_time)
+    end_dt = start_dt + (old_end - old_start)
+    timezone = str(get_timezone())
+    event["start"] = {"dateTime": start_dt.isoformat(), "timeZone": timezone}
+    event["end"] = {"dateTime": end_dt.isoformat(), "timeZone": timezone}
 
 
-def delete_event(user_id: str, event_id: str):
+def _move_all_day_event(event: dict, updates: dict):
+    if "time" in updates:
+        raise ValueError("Evento de dia inteiro não tem horário.")
+    old_start = date.fromisoformat(event["start"]["date"])
+    old_end = date.fromisoformat(event["end"]["date"])
+    new_start = datetime.strptime(updates["date"], "%d/%m/%Y").date()
+    # O fim de evento de dia inteiro é exclusivo: mantendo a distância, mantém os dias.
+    event["start"] = {"date": new_start.isoformat()}
+    event["end"] = {"date": (new_start + (old_end - old_start)).isoformat()}
+
+
+def delete_event(user_id: str, calendar_id: str, event_id: str):
     service = get_calendar_service(user_id)
-    service.events().delete(calendarId="primary", eventId=event_id).execute()
+    service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
 
 
 # --- Horários livres ---
