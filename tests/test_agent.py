@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -535,3 +536,18 @@ class TestMarcoPersistido(_BaseAvisoEventoNovo):
         # Avançar aqui faria os eventos daquele usuário serem pulados para sempre.
         self._run([], baseline=AGORA - timedelta(minutes=15), falha_na_busca=True)
         self.salvar_marco.assert_not_called()
+
+
+class TestLogSemToken:
+    def test_nao_registra_o_endereco_das_chamadas_ao_telegram(self):
+        # Regressão: o endereço das chamadas ao Telegram contém o token do
+        # bot, e o log do container aparece no deploy, que é público.
+        root = logging.getLogger()
+        previous_level = root.level
+        # Em produção o basicConfig do agent põe tudo em INFO. Sob o pytest
+        # ele não tem efeito, e sem isto o teste passaria com o vazamento.
+        root.setLevel(logging.INFO)
+        try:
+            assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+        finally:
+            root.setLevel(previous_level)

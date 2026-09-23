@@ -27,6 +27,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# A biblioteca HTTP registra cada chamada em INFO, e o endereço das chamadas
+# ao Telegram contém o token do bot. O log do container aparece no deploy,
+# que é público: o token vazou assim.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 CHECK_INTERVAL_SECONDS = 60 * 15
