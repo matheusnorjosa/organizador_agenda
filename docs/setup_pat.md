@@ -6,7 +6,7 @@ Guia para ligar o deploy automático e a exclusão automática de branch. Leva ~
 
 | Renovado em | Expira em | Prazo escolhido |
 |---|---|---|
-| 24/08/2026 | **22/11/2026** | 90 dias |
+| 16/11/2026 | **16/11/2027** | 1 ano |
 
 Para renovar, gere outro token com as permissões da seção abaixo e rode:
 
