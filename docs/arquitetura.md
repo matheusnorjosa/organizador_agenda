@@ -197,7 +197,7 @@ Para provar que um teste de regressão realmente pega o bug, rodá-lo contra o c
 
 ## Deploy
 
-Ver `.claude/skills/deploy/SKILL.md`. Resumo: PR → auto-merge (squash) → o merge dispara o deploy sozinho, porque o auto-merge usa o `AUTO_MERGE_PAT`. O PAT expira em **22/11/2026** (`docs/setup_pat.md`). Sem ele, o deploy volta a exigir `gh workflow run deploy.yml`. Conferir sempre o log do deploy, e não só o status.
+Ver `.claude/skills/deploy/SKILL.md`. Resumo: PR → auto-merge (squash) → o merge dispara o deploy sozinho, porque o auto-merge usa o `AUTO_MERGE_PAT`. O PAT expira em **16/11/2027** (`docs/setup_pat.md`). Sem ele, o deploy volta a exigir `gh workflow run deploy.yml`. Conferir sempre o log do deploy, e não só o status.
 
 O `Dockerfile` copia apenas `src/` e `requirements.txt` — mudança só em `docs/`, `tests/` ou `.claude/` não exige deploy.
 
